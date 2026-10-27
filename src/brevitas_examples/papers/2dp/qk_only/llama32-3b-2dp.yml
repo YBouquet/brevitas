@@ -1,0 +1,41 @@
+# Llama-3.2-3B, only Q and K quantized: MXFP4 (e2m1, E8M0 floor-rounded block-32 scales).
+# Weights, linear inputs, V and softmax stay in bf16; no rotation (the weight_*/input_* keys
+# are the template the attention quantizers are built from).
+# QK^T head: 2DP (exact rank-2 plane, frozen U).
+bos_preprocessing: sequence
+dtype: bfloat16
+eval: true
+replace_rmsnorm: true
+model: meta-llama/Llama-3.2-3B
+scale_rounding_func_type: floor
+weight_bit_width: 4
+weight_quant_format: float_ocp_e2m1
+weight_group_size: 32
+weight_param_method: mse
+weight_quant_granularity: per_group
+weight_quant_type: sym
+weight_scale_precision: po2_scale
+input_bit_width: 4
+input_quant_format: float_ocp_e2m1
+input_group_size: 32
+input_param_method: stats
+input_quant_granularity: per_group
+input_quant_type: sym
+input_scale_precision: po2_scale
+input_scale_type: dynamic
+quant_sdpa: eager
+attn_quant_config: qk
+attn_bit_width: 4
+attn_quant_format: float_ocp_e2m1
+attn_group_size: 32
+attn_quant_granularity: per_group
+attn_quant_type: sym
+attn_scale_precision: po2_scale
+attn_scale_type: dynamic
+dc_extract_qk: true
+dc_sub_dim: 2
+dataset_eval_split: test
+nsamples: -1
+no_quantize_linear: true
+dc_u_mode: frozen
+dc_u_calib: selfgen
