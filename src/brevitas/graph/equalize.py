@@ -1627,7 +1627,11 @@ def _compute_rotations(
         expansion_step: int = 1,
         rotation_block_size: Optional[int] = None,
         disable_block_rotation_for_fused: bool = False,
-        generator: Optional[torch.Generator] = None):
+        generator: Optional[torch.Generator] = None,
+        value_region_rand: bool = False,
+        value_rand_generator: Optional[torch.Generator] = None,
+        value_rand_shared_seed: Optional[int] = None,
+        value_det: bool = False):
 
     rewriters = []
     # First, rotations on orphan sinks are applied so the order in which rotations are
@@ -1662,8 +1666,26 @@ def _compute_rotations(
             expanded_hidden_dim = find_closest_hadamard_number(
                 region.max_shape_sinks, steps=expansion_step)
 
-        if not insert_rotation_module and full_rotation_method == 'ort':
+        # Value -> output (R2) regions can use their own rotation policy, independent of
+        # full_rotation_method: a random Hadamard drawn from a dedicated seeded generator (one draw
+        # per region, or one draw shared by all regions), or a deterministic Hadamard (value_det).
+        is_value_region = 'value_sdpa' in region.srcs_names
+        if not insert_rotation_module and value_region_rand and is_value_region:
+            device = next(model.parameters()).device
+            if value_rand_shared_seed is not None:
+                # Re-seed before every draw so that every region gets the same sign pattern
+                value_rand_generator.manual_seed(value_rand_shared_seed)
+            rot_mat = random_hadamard_matrix(hidden_dim, device, generator=value_rand_generator)
+            rot_func = _apply_ort_device
+        elif not insert_rotation_module and full_rotation_method == 'ort':
             rot_mat = random_orthogonal_matrix(hidden_dim, generator=generator)
+            rot_func = _apply_ort_device
+        elif not insert_rotation_module and full_rotation_method == 'had_rand' and not (
+                value_det and is_value_region):
+            # Randomized Hadamard (H·D) for fused regions, also when fuse_rotations=True.
+            # With value_det, value regions fall through to the deterministic Hadamard below.
+            device = next(model.parameters()).device
+            rot_mat = random_hadamard_matrix(hidden_dim, device, generator=generator)
             rot_func = _apply_ort_device
         elif not insert_rotation_module and not fuse_rotations:
             # If the model is distributed across GPUs, the device will be
@@ -1955,6 +1977,11 @@ class GraphRotationEqualization(RotationEqualization, RegionWalkMixin):
             blacklist_layers: Optional[List[str]] = None,
             orphan_sink: bool = False,
             sdpa_regions: bool = False,
+            sdpa_value_only: bool = False,
+            sdpa_value_rand: bool = False,
+            sdpa_value_rand_seed: int = 0,
+            sdpa_value_rand_shared: bool = False,
+            sdpa_value_det: bool = False,
             rotate_matmul: bool = False,
             use_parametrized_rotations: bool = False,
             full_rotation_method: str = 'had',
@@ -1979,6 +2006,13 @@ class GraphRotationEqualization(RotationEqualization, RegionWalkMixin):
         self.full_rotation_method = full_rotation_method
         self.return_rewriters = return_rewriters
         self.sdpa_regions = sdpa_regions
+        self.sdpa_value_only = sdpa_value_only
+        self.sdpa_value_rand = sdpa_value_rand
+        self.sdpa_value_rand_seed = sdpa_value_rand_seed
+        self.sdpa_value_rand_shared = sdpa_value_rand_shared
+        self.sdpa_value_det = sdpa_value_det
+        if sdpa_value_det and sdpa_value_rand:
+            raise ValueError("sdpa_value_det and sdpa_value_rand are mutually exclusive")
         self.expansion_step = expansion_step
         self.delay_rewriters = delay_rewriters
         self.rotation_block_size = rotation_block_size
@@ -2030,7 +2064,7 @@ class GraphRotationEqualization(RotationEqualization, RegionWalkMixin):
             graph_module.recompile()
             graph_module.graph.lint()
 
-    def rotate_sdpa(self, graph_module):
+    def rotate_sdpa(self, graph_module, value_only=False):
         sdpa_nodes = list(graph_module.graph.nodes)
         sdpa_nodes = [
             c for c in sdpa_nodes
@@ -2096,10 +2130,16 @@ class GraphRotationEqualization(RotationEqualization, RegionWalkMixin):
             if region.is_valid:
                 regions.append(region)
 
-            for m in graph_module.modules():
-                if isinstance(m, ScaledDotProductAttention):
-                    m.pre_process_q = functional_rotate_input
-                    m.pre_process_k = functional_rotate_input
+            # With value_only, only the value -> output (R2) region is built and the Q/K head is
+            # left untouched, so a custom quantized SDPA can handle the Q/K head itself.
+            if not value_only:
+                for m in graph_module.modules():
+                    if isinstance(m, ScaledDotProductAttention):
+                        m.pre_process_q = functional_rotate_input
+                        m.pre_process_k = functional_rotate_input
+        logging.info(
+            f"rotate_sdpa (value_only={value_only}): {len(regions)} valid value->output region(s) "
+            f"from {len(sdpa_nodes)} SDPA node(s)")
         return regions
 
     def apply(self,
@@ -2126,9 +2166,21 @@ class GraphRotationEqualization(RotationEqualization, RegionWalkMixin):
                 parameter_number_pre += m.numel()
             logging.info(f"{len(expanded_regions)} layers will be expanded during rotation")
 
-        if self.sdpa_regions:
-            sdpa_regions = self.rotate_sdpa(graph_model)
+        value_only = self.sdpa_value_only or self.sdpa_value_rand or self.sdpa_value_det
+        if self.sdpa_regions or value_only:
+            sdpa_regions = self.rotate_sdpa(
+                graph_model, value_only=value_only and not self.sdpa_regions)
             self.regions.extend(sdpa_regions)
+
+        # Dedicated seeded generator for random value-region rotations: the draws are reproducible
+        # and independent of the global RNG used by the other fused rotations.
+        value_rand_generator = None
+        value_rand_shared_seed = None
+        if self.sdpa_value_rand:
+            value_rand_generator = torch.Generator(device='cpu').manual_seed(
+                self.sdpa_value_rand_seed)
+            if self.sdpa_value_rand_shared:
+                value_rand_shared_seed = self.sdpa_value_rand_seed
 
         logging.debug(f"Applying GraphRotationEqualization on {len(self.regions)} regions")
 
@@ -2175,7 +2227,11 @@ class GraphRotationEqualization(RotationEqualization, RegionWalkMixin):
                     fuse_rotations=not self.use_parametrized_rotations,
                     expansion_step=first_exp_step,
                     rotation_block_size=self.rotation_block_size,
-                    disable_block_rotation_for_fused=self.disable_block_rotation_for_fused))
+                    disable_block_rotation_for_fused=self.disable_block_rotation_for_fused,
+                    value_region_rand=self.sdpa_value_rand,
+                    value_rand_generator=value_rand_generator,
+                    value_rand_shared_seed=value_rand_shared_seed,
+                    value_det=self.sdpa_value_det))
             rewriters.extend(
                 _compute_rotations(
                     graph_model,
@@ -2184,7 +2240,11 @@ class GraphRotationEqualization(RotationEqualization, RegionWalkMixin):
                     fuse_rotations=not self.use_parametrized_rotations,
                     expansion_step=second_exp_step,
                     rotation_block_size=self.rotation_block_size,
-                    disable_block_rotation_for_fused=self.disable_block_rotation_for_fused))
+                    disable_block_rotation_for_fused=self.disable_block_rotation_for_fused,
+                    value_region_rand=self.sdpa_value_rand,
+                    value_rand_generator=value_rand_generator,
+                    value_rand_shared_seed=value_rand_shared_seed,
+                    value_det=self.sdpa_value_det))
             if len(expanded_regions) > 0:
                 parameter_number_post = 0
                 for m in graph_model.parameters():

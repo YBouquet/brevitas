@@ -482,3 +482,52 @@ def test_fuse_parametrized_modules_after_compile_and_train(device):
         output_after_fuse = qmodel(sample_input)
     assert torch.allclose(output_before_fuse, output_after_fuse, rtol=0.0, atol=0.0)
     torch.set_default_device('cpu')
+
+
+def test_value_det_and_value_rand_are_exclusive():
+    with pytest.raises(ValueError):
+        GraphRotationEqualization(sdpa_value_det=True, sdpa_value_rand=True)
+
+
+def _value_region_model(seed=0):
+    torch.manual_seed(seed)
+    return nn.ModuleDict({'v': nn.Linear(8, 8, bias=False), 'o': nn.Linear(8, 8, bias=False)})
+
+
+def _rotate_value_region(model, seed, **kwargs):
+    # A value -> output (R2) region, named like the ones built by rotate_sdpa
+    region = Region.from_dicts(
+        srcs={'value_sdpa': EqualizationIndexes(0, 8, 0)},
+        sinks={'output_sdpa': EqualizationIndexes(0, 8, 0)},
+        name_to_module={
+            'value_sdpa': model['v'], 'output_sdpa': model['o']})
+    generator = torch.Generator().manual_seed(seed)
+    rewriters = _compute_rotations(
+        model, [region], full_rotation_method='had_rand', generator=generator, **kwargs)
+    apply_rewriters(model, rewriters)
+    return model
+
+
+@pytest_cases.parametrize('value_kwargs', [{}, {'value_det': True}], ids=['had_rand', 'value_det'])
+def test_value_region_rotation(value_kwargs):
+    x = torch.randn(3, 8)
+    base = _value_region_model()
+    ref = base['o'](base['v'](x))
+    rotated = [_rotate_value_region(copy.deepcopy(base), seed, **value_kwargs) for seed in (0, 1)]
+    for m in rotated:
+        assert torch.allclose(m['o'](m['v'](x)), ref, atol=1e-5)
+    same = torch.equal(rotated[0]['v'].weight, rotated[1]['v'].weight)
+    # had_rand draws R2 from the generator; with value_det, R2 is the deterministic Hadamard
+    assert same == bool(value_kwargs)
+
+
+def test_value_region_rand_ignores_r1_generator():
+    base = _value_region_model()
+    weights = []
+    for seed in (0, 1):
+        value_gen = torch.Generator().manual_seed(7)
+        m = _rotate_value_region(
+            copy.deepcopy(base), seed, value_region_rand=True, value_rand_generator=value_gen)
+        weights.append(m['v'].weight)
+    assert torch.equal(weights[0], weights[1])
+    assert not torch.equal(weights[0], base['v'].weight)
