@@ -311,7 +311,7 @@ def generate_quantizers(
         input_quant_type=None,
         input_quant_granularity=None,
         input_group_size=None,
-        attn_quant_config="qkvs",  # choices: "kv", "qkvs", "qkv"
+        attn_quant_config="qkvs",  # choices: "kv", "qkvs", "qkv", "qk"
         attn_bit_width=None,
         attn_quant_format=None,
         attn_scale_precision=None,
@@ -406,7 +406,7 @@ def generate_quantizers(
         # Enable signed scale if specified in the attention scale precision format
         k_transposed_quant = maybe_inject_signed_scale_kwargs(
             k_transposed_quant, attn_scale_precision, attn_scale_quant_kwargs)
-        if attn_quant_config == "qkvs" or attn_quant_config == 'qkv':
+        if attn_quant_config in ("qkvs", "qkv", "qk"):
             q_scaled_quant = k_transposed_quant  # later we define attn_output_weights_quant=q_scaled_quant, so don't instantiate it here
         elif attn_quant_config == "kv":
             q_scaled_quant = None
@@ -498,10 +498,11 @@ def generate_quantizers(
             k_transposed_quant = k_transposed_quant.let(
                 **{
                     'group_dim': -2, 'group_size': attn_group_size})
-        v_quant = k_transposed_quant
+        # "qk" quantizes only the two operands of QK^T
+        v_quant = k_transposed_quant if attn_quant_config != 'qk' else None
 
         # If we only quantize QKV< set attn_output_weight_quant to None
-        if attn_quant_config == 'qkv':
+        if attn_quant_config in ('qkv', 'qk'):
             attn_output_weights_quant = None
         else:
             attn_output_weights_quant = q_scaled_quant
@@ -543,7 +544,14 @@ def generate_quant_maps(
         attn_output_weights_quant,
         dtype,
         device,
-        quantize_embedding):
+        quantize_embedding,
+        dc_extract_kwargs=None):
+    """Map float layer types to their quantized counterparts and constructor kwargs.
+
+    ``dc_extract_kwargs``: if not None, quantized SDPA uses the 2DP module
+    (:class:`~brevitas_examples.llm.dc_extract_sdpa.DCExtractQuantScaledDotProductAttention`) with
+    these extra kwargs.
+    """
 
     quant_linear_kwargs = {
         'input_quant': linear_input_quant,
@@ -591,6 +599,20 @@ def generate_quant_maps(
         'diffusers.models.lora.LoRACompatibleConv': (LoRACompatibleQuantConv2d, quant_conv_kwargs),
         nn.MultiheadAttention: (qnn.QuantMultiheadAttention, quant_mha_kwargs),
         qnn.ScaledDotProductAttention: (qnn.QuantScaledDotProductAttention, quant_sdpa_kwargs)}
+
+    if dc_extract_kwargs is not None:
+        from brevitas_examples.llm.dc_extract_sdpa import DCExtractQuantScaledDotProductAttention
+
+        # The 2DP module quantizes K before the transpose (head_dim last), so K and V group along
+        # the last dim instead of the stock -2. No-op for formats without groups.
+        if quant_sdpa_kwargs.get('k_transposed_quant') is not None:
+            quant_sdpa_kwargs['k_transposed_quant'] = quant_sdpa_kwargs['k_transposed_quant'].let(
+                group_dim=-1)
+        if quant_sdpa_kwargs.get('v_quant') is not None:
+            quant_sdpa_kwargs['v_quant'] = quant_sdpa_kwargs['v_quant'].let(group_dim=-1)
+        quant_sdpa_kwargs.update(dc_extract_kwargs)
+        layer_map[qnn.ScaledDotProductAttention] = (
+            DCExtractQuantScaledDotProductAttention, quant_sdpa_kwargs)
 
     if quantize_embedding:
         quant_embedding_kwargs = {'weight_quant': weight_quant, 'dtype': dtype, 'device': device}

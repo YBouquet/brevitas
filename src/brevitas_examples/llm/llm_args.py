@@ -225,9 +225,9 @@ def create_args_parser() -> ArgumentParser:
         '--attn-quant-config',
         type=str,
         default='qkvs',
-        choices=['qkvs', 'qkv', 'kv'],
+        choices=['qkvs', 'qkv', 'kv', 'qk'],
         help=
-        'Decide which parts of attention should be quantized. "kv" will only quantize KV, "qkvs" will quantize all MatMuls in attention (QKV & Softmax output). Note: --quant-sdpa needs be set for this to have an effect. Default: %(default)s'
+        'Decide which parts of attention should be quantized. "kv" will only quantize KV, "qk" only the operands of QK^T, "qkvs" will quantize all MatMuls in attention (QKV & Softmax output). Note: --quant-sdpa needs be set for this to have an effect. Default: %(default)s'
     )
     parser.add_argument(
         '--attn-bit-width',
@@ -347,6 +347,12 @@ def create_args_parser() -> ArgumentParser:
         '--replace-rmsnorm', action='store_true', help='Replace HF RMSNorms with Torch one.')
     parser.add_argument('--no-quantize', action='store_true', help='Disable quantization.')
     parser.add_argument(
+        '--no-quantize-linear',
+        action='store_true',
+        help='Keep the weights and inputs of linear layers in full precision and quantize only '
+        'attention (per --attn-quant-config). The input_* options must still be set: they are the '
+        'defaults of the attn_* options.')
+    parser.add_argument(
         '--scaling-min-val',
         type=float,
         default=1e-4,
@@ -405,9 +411,9 @@ def create_args_parser() -> ArgumentParser:
     parser.add_argument(
         '--rotation-mode',
         default='had',
-        choices=['had', 'ort'],
+        choices=['had', 'ort', 'had_rand'],
         help=
-        'If GraphRotation is enabled, decide how to compute the random rotation matrix that is fully fused. Online or partial rotation will always be Hadamard'
+        'If GraphRotation is enabled, decide how to compute the random rotation matrix that is fully fused. Online or partial rotation will always be Hadamard. had_rand: Hadamard with random sign flips'
     )
     parser.add_argument(
         '--rotation-orphan-sink',
@@ -419,6 +425,31 @@ def create_args_parser() -> ArgumentParser:
         '--rotation-sdpa-regions',
         action="store_true",
         help='If GraphRotation is enabled, decide wheter to equalize across SDPA')
+    parser.add_argument(
+        '--rotation-sdpa-value-only',
+        action="store_true",
+        help=
+        'If GraphRotation is enabled, rotate only the SDPA value region (R2, fused into the value '
+        'and output projections), not the Q/K head. Ignored with --rotation-sdpa-regions.')
+    parser.add_argument(
+        '--rotation-sdpa-value-det',
+        action="store_true",
+        help='Like --rotation-sdpa-value-only, with a deterministic Hadamard R2 even when '
+        '--rotation-mode is had_rand (QuaRot setting: random R1, deterministic R2).')
+    parser.add_argument(
+        '--rotation-sdpa-value-rand',
+        action="store_true",
+        help='Like --rotation-sdpa-value-only, with an independent random Hadamard R2 per block, '
+        'whatever --rotation-mode.')
+    parser.add_argument(
+        '--rotation-sdpa-value-rand-seed',
+        default=0,
+        type=int,
+        help='Seed of the random R2 draws. Default: %(default)s')
+    parser.add_argument(
+        '--rotation-sdpa-value-rand-shared',
+        action="store_true",
+        help='With --rotation-sdpa-value-rand, use one random R2 for all blocks.')
     parser.add_argument(
         '--rotation-layers-to-expand',
         type=str,
@@ -547,6 +578,12 @@ def create_args_parser() -> ArgumentParser:
     parser.add_argument(
         '--few-shot-limit', type=int, default=None, help='Few shot limit. Default %(default)s)')
     parser.add_argument(
+        '--few-shot-samples-out',
+        type=str,
+        default=None,
+        help='lm_eval only: write the per-candidate log-likelihoods of every question to this JSON '
+        'file, for paired comparisons between runs. Default %(default)s)')
+    parser.add_argument(
         '--few-shot-tasks',
         default=['arc_challenge', 'arc_easy', 'winogrande', 'piqa'],
         type=str,
@@ -567,11 +604,160 @@ def create_args_parser() -> ArgumentParser:
         type=int,
         default=1,
         help='Batch size for calibration data loader. (default: %(default)s).')
+    add_dc_extract_args(parser)
 
     # Adds Scale Optimization (--sopt-*) flags (PiSO being the current solver instance behind them).
     ScaleOptimizerArgumentParser.add_arguments(parser)
 
     return parser
+
+
+def add_dc_extract_args(parser: ArgumentParser):
+    """Options of 2DP (exact DC plane + quantized residual for QK^T), see dc_extract_sdpa.py."""
+    group = parser.add_argument_group('2DP (QK^T with an exact DC plane)')
+    group.add_argument(
+        '--dc-extract-qk',
+        action="store_true",
+        help='Compute QK^T with the 2DP attention module. Requires --quant-sdpa. Forces '
+        '--rotation-sdpa-regions off: the Q/K head is handled by the module (--dc-sub-dim).')
+    group.add_argument(
+        '--dc-sub-dim',
+        type=int,
+        default=2,
+        help='Rank of the exact plane (2 = 2DP). < 0: full head-dim Hadamard on Q/K before '
+        'quantization (QuaRot R3). 0: quantize Q/K unchanged. Default: %(default)s')
+    group.add_argument(
+        '--dc-correction',
+        type=str,
+        default='none',
+        choices=['none', 'unshrink', 'mean', 'scale'],
+        help='Score shrinkage correction: unshrink = divide the quantized score by 1 - gamma; mean = '
+        'subtract gamma times the score of the mean query plane coordinate; scale = scale the exact '
+        'plane by 1 - gamma. Default: %(default)s')
+    group.add_argument(
+        '--dc-gamma',
+        type=float,
+        default=0.0,
+        help='gamma of --dc-correction, e.g. the gamma_attn(pred) printed by --sqnr-decomp. '
+        'Default: %(default)s')
+    group.add_argument(
+        '--dc-abar-mode',
+        type=str,
+        default='full',
+        choices=['full', 'causal'],
+        help='Mean query coordinate of --dc-correction mean: over the whole sequence or over '
+        'positions <= i. Default: %(default)s')
+    group.add_argument(
+        '--dc-sinkbal',
+        action="store_true",
+        help='Oracle diagnostic (uses the unquantized score): set the sink-key score error to the '
+        'attention-weighted error of the other keys.')
+    group.add_argument(
+        '--dc-had-rand',
+        action="store_true",
+        help='With --dc-sub-dim < 0, randomize the Q/K Hadamard with sign flips (one per layer).')
+    group.add_argument(
+        '--dc-had-rand-shared',
+        action="store_true",
+        help='With --dc-had-rand, use the same sign flips in every layer.')
+    group.add_argument(
+        '--dc-had-seed', type=int, default=0, help='Seed of --dc-had-rand. Default: %(default)s')
+    group.add_argument(
+        '--dc-had-layers',
+        type=str,
+        nargs='*',
+        default=[],
+        help='Decoder layers that use the Q/K Hadamard (--dc-sub-dim -1) instead of 2DP: indices, '
+        'inclusive ranges A-B, "first" or "last". Default: %(default)s')
+    group.add_argument(
+        '--dc-tcast-scale',
+        type=str,
+        default=None,
+        help='Replace the output of the attention quantizers by a tcast virtual cast to e2m1 '
+        'elements with this block-scale spec (e.g. e4m3fn_t32 for an E4M3 block-32 scale). '
+        'Requires the tcast package. Default: %(default)s')
+    group.add_argument(
+        '--dc-u-mode',
+        type=str,
+        default='live',
+        choices=['live', 'frozen'],
+        help='live: estimate the plane per sequence. frozen: one plane per layer and KV group, '
+        'loaded from --dc-u-path if it exists, else calibrated (and saved to --dc-u-path if set). '
+        'Default: %(default)s')
+    group.add_argument(
+        '--dc-u-path',
+        type=str,
+        default=None,
+        help='File of the frozen plane. Default: %(default)s')
+    group.add_argument(
+        '--dc-u-calib',
+        type=str,
+        default='wikitext2',
+        choices=['wikitext2', 'random', 'selfgen'],
+        help='Calibration data of the frozen plane: --nsamples-rot-calibration WikiText-2 train '
+        'windows, as many uniform random token sequences, or --dc-selfgen-nsamples sequences sampled '
+        'from the float model. Default: %(default)s')
+    group.add_argument(
+        '--dc-u-calib-seqlen',
+        type=int,
+        default=None,
+        help='Sequence length of random/selfgen calibration sequences. Default: --seqlen')
+    group.add_argument(
+        '--dc-u-basis',
+        type=str,
+        default='mean',
+        choices=['mean', 'pca'],
+        help='Frozen plane: QR of the query and key means, or top-2 eigenvectors of the normalized '
+        'Q and K second moments. Default: %(default)s')
+    group.add_argument(
+        '--dc-u-space',
+        type=str,
+        default='lf',
+        choices=['lf', 'full'],
+        help='Frozen plane on the low-frequency half of the head or on the full head. '
+        'Default: %(default)s')
+    group.add_argument(
+        '--dc-u-pca-center',
+        action="store_true",
+        help='With --dc-u-basis pca, use centered second moments (covariances).')
+    group.add_argument(
+        '--dc-u-ref',
+        type=str,
+        nargs='*',
+        default=[],
+        help='Frozen-plane files to compare a newly calibrated plane with (subspace overlap).')
+    group.add_argument(
+        '--dc-selfgen-nsamples',
+        type=int,
+        default=64,
+        help='Number of self-generated calibration sequences. Default: %(default)s')
+    group.add_argument(
+        '--dc-selfgen-temperature',
+        type=float,
+        default=1.0,
+        help='Sampling temperature of the self-generated sequences. Default: %(default)s')
+    group.add_argument(
+        '--dc-selfgen-top-p',
+        type=float,
+        default=0.95,
+        help='Nucleus (top-p) of the self-generated sequences. Default: %(default)s')
+    group.add_argument(
+        '--dc-selfgen-batch-size',
+        type=int,
+        default=16,
+        help='Generation batch size of the self-generated sequences. Default: %(default)s')
+    group.add_argument(
+        '--sqnr-decomp',
+        type=int,
+        default=0,
+        help='Before the quantized PPL, print the per-layer error decomposition over this many '
+        'evaluation chunks (0: off). Needs --dc-extract-qk for the attention part. '
+        'Default: %(default)s')
+    group.add_argument(
+        '--mf-probe-gamma',
+        type=float,
+        default=None,
+        help='Add the m/f probe at this gamma to --sqnr-decomp. Default: %(default)s')
 
 
 def fx_required(args: Namespace):
@@ -679,9 +865,38 @@ def validate(args: Namespace, extra_args: Optional[List[str]] = None) -> None:
                 assert args.quantize_input_zero_point, "Quantized input zero point required."
         if args.input_bit_width and args.input_scale_type == 'static':
             assert args.act_calibration, "Static input quantization is being applied without activation calibration. Set --act-calibration."
+        if args.no_quantize_linear:
+            assert args.input_bit_width is not None and args.quant_sdpa is not None, \
+                "--no-quantize-linear keeps only the attention quantizers: set --quant-sdpa and input_bit_width"
+    assert not (args.rotation_sdpa_value_det and args.rotation_sdpa_value_rand), \
+        "--rotation-sdpa-value-det and --rotation-sdpa-value-rand are exclusive"
+    validate_dc_extract(args)
 
     # Validate Scale Optimization (--sopt-*) flags
     ScaleOptimizerArgumentParser.validate(args, extra_args)
+
+
+def validate_dc_extract(args: Namespace) -> None:
+    if not args.dc_extract_qk:
+        dc_defaults = {
+            'dc_correction': 'none',
+            'dc_sinkbal': False,
+            'dc_had_rand': False,
+            'dc_had_layers': [],
+            'dc_tcast_scale': None,
+            'dc_u_mode': 'live',
+            'sqnr_decomp': 0}
+        changed = [k for k, v in dc_defaults.items() if getattr(args, k) != v]
+        assert not changed, f"{changed} require --dc-extract-qk"
+        return
+    assert args.quant_sdpa is not None, "--dc-extract-qk requires --quant-sdpa"
+    if args.dc_correction != 'none':
+        assert 0.0 < args.dc_gamma < 1.0, "--dc-correction needs --dc-gamma in (0, 1)"
+    if args.dc_correction == 'scale':
+        assert args.dc_sub_dim > 0, "--dc-correction scale needs an exact plane (--dc-sub-dim > 0)"
+    assert not args.dc_had_rand_shared or args.dc_had_rand, "--dc-had-rand-shared needs --dc-had-rand"
+    if args.mf_probe_gamma is not None:
+        assert args.sqnr_decomp > 0, "--mf-probe-gamma runs inside --sqnr-decomp"
 
 
 def attn_quant_format_validator(value):

@@ -1,6 +1,8 @@
 # Copyright (C) 2024, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import inspect
+
 import torch
 import torch.nn.functional as F
 from transformers.integrations.executorch import TorchExportableModuleForDecoderOnlyLM
@@ -84,8 +86,16 @@ class make_dynamo_compatible:
         # but then we can unwrap it immediately.
         # We need to specify batch_size and max_cache_len. The latter is not important since we disable
         # cache anyway while we trace the model.
+        # transformers >= 4.55 renamed batch_size to max_batch_size and reads
+        # generation_config.cache_config, which may be None.
+        if 'max_batch_size' in inspect.signature(TorchExportableModuleForDecoderOnlyLM).parameters:
+            if getattr(self.model.generation_config, 'cache_config', None) is None:
+                self.model.generation_config.cache_config = {"batch_size": 1, "max_cache_len": 1}
+            batch_kwargs = {'max_batch_size': 1}
+        else:
+            batch_kwargs = {'batch_size': 1}
         self.model = TorchExportableModuleForDecoderOnlyLM(
-            self.model, batch_size=1, max_cache_len=1).model.model
+            self.model, max_cache_len=1, **batch_kwargs).model.model
         # Caching should be disabled to make it work with dynamo
         # The other alternative is to use static_cache
         self.model.config.use_cache = False

@@ -43,6 +43,11 @@ from brevitas_examples.common.generative.quantize import generate_quantizers
 from brevitas_examples.common.generative.quantizers import QUANTIZERS_REGISTRY
 from brevitas_examples.common.parse_utils import override_defaults
 from brevitas_examples.common.parse_utils import parse_args
+from brevitas_examples.llm.dc_extract_sdpa import assign_layer_ids
+from brevitas_examples.llm.dc_extract_sdpa import build_frozen_u
+from brevitas_examples.llm.dc_extract_sdpa import dc_modules
+from brevitas_examples.llm.dc_extract_sdpa import set_frozen_u
+from brevitas_examples.llm.dc_extract_sdpa import u_overlap_logging
 from brevitas_examples.llm.gguf_export.export import save_quantized_as_gguf
 from brevitas_examples.llm.llm_args import create_args_parser
 from brevitas_examples.llm.llm_args import fx_required
@@ -125,6 +130,233 @@ def tie_weights(args):
     return _should_tie
 
 
+# Conventional per-task metric of the QuaRot/SpinQuant-style zero-shot average.
+ZEROSHOT_METRIC = {
+    'arc_easy': 'acc_norm',
+    'arc_challenge': 'acc_norm',
+    'hellaswag': 'acc_norm',
+    'openbookqa': 'acc_norm',
+    'piqa': 'acc_norm',
+    'winogrande': 'acc',
+    'boolq': 'acc'}
+
+
+def _pick_metric(eval_results, task, metric):
+    # filter_results keys look like 'arc_easy_acc_norm,none'
+    target = f"{task}_{metric}"
+    for key, val in eval_results.items():
+        if key.split(',')[0] == target and isinstance(val, (int, float)):
+            return val
+    return None
+
+
+def compute_zeroshot_avg(eval_results, tasks):
+    """Unweighted mean over tasks of ZEROSHOT_METRIC (acc when not listed or not reported)."""
+    vals = []
+    for task in tasks:
+        preferred = ZEROSHOT_METRIC.get(task, 'acc')
+        val = _pick_metric(eval_results, task, preferred)
+        if val is None and preferred != 'acc':
+            val = _pick_metric(eval_results, task, 'acc')
+        if val is not None:
+            vals.append(val)
+    return sum(vals) / len(vals) if vals else None
+
+
+def dump_few_shot_samples(results, path):
+    """Write lm_eval per-question records (target, correctness, per-candidate log-likelihoods)."""
+    import json
+    dump = {}
+    for task, recs in (results.get("samples") or {}).items():
+        dump[task] = [{
+            "target":
+                r.get("target"),
+            "acc":
+                r.get("acc"),
+            "acc_norm":
+                r.get("acc_norm"),
+            "resps": [[float(x[0]), bool(x[1])]
+                      for x in (r.get("filtered_resps") or [])],
+            "conts": [
+                str(a[1])
+                for a in (r.get("arguments") or [])
+                if isinstance(a, (list, tuple)) and len(a) > 1]}
+                      for r in recs]
+    with open(path, "w") as f:
+        json.dump(dump, f)
+    print(
+        f"Wrote {sum(len(v) for v in dump.values())} few-shot records ({len(dump)} tasks) to {path}"
+    )
+
+
+def sdpa_value_rotation_kwargs(args):
+    return dict(
+        sdpa_value_only=args.rotation_sdpa_value_only,
+        sdpa_value_rand=args.rotation_sdpa_value_rand,
+        sdpa_value_rand_seed=args.rotation_sdpa_value_rand_seed,
+        sdpa_value_rand_shared=args.rotation_sdpa_value_rand_shared,
+        sdpa_value_det=args.rotation_sdpa_value_det)
+
+
+def print_rotation_summary(args):
+    if args.rotation is None:
+        return
+    if args.rotation_sdpa_value_rand:
+        mode = "one shared draw" if args.rotation_sdpa_value_rand_shared else "per-block draws"
+        print(
+            f"[R2-rand] random R2 ({mode}, seed={args.rotation_sdpa_value_rand_seed}); "
+            f"R1/full_rotation_method='{args.rotation_mode}'")
+    elif args.rotation_sdpa_value_det:
+        print(
+            f"[R2-det] deterministic R2 (Sylvester Hadamard) on value regions; "
+            f"R1/full_rotation_method='{args.rotation_mode}'")
+
+
+def parse_layer_list(tokens, n_layers):
+    """Layer indices from tokens: integers, inclusive ranges 'A-B', 'first', 'last'."""
+    out = set()
+    for tok in tokens:
+        for t in tok.replace(',', ' ').split():
+            if t == 'first':
+                out.add(0)
+            elif t == 'last':
+                out.add(n_layers - 1)
+            elif '-' in t:
+                a, b = (int(x) for x in t.split('-'))
+                out.update(range(a, b + 1))
+            else:
+                out.add(int(t))
+    return out
+
+
+def generate_selfgen_ids(model, tokenizer, args):
+    """Data-free calibration text sampled from the float model.
+
+    Each sequence starts with BOS and one uniformly random token, then is sampled at temperature
+    --dc-selfgen-temperature with nucleus --dc-selfgen-top-p. Returns ``[n, seqlen]`` token ids."""
+    n = args.dc_selfgen_nsamples
+    seqlen = args.dc_u_calib_seqlen or args.seqlen
+    bs = args.dc_selfgen_batch_size
+    model = offload_model(model)
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    g = torch.Generator().manual_seed(args.seed)
+    vmax = min(getattr(tokenizer, "vocab_size", 128000), 128000)
+    out = []
+    torch.manual_seed(args.seed)
+    with torch.no_grad():
+        for s in range(0, n, bs):
+            b = min(bs, n - s)
+            first = torch.randint(0, vmax, (b, 1), generator=g)
+            inp = torch.cat([torch.full((b, 1), tokenizer.bos_token_id), first], dim=1).to(dev)
+            gen = model.generate(
+                input_ids=inp,
+                attention_mask=torch.ones_like(inp),
+                do_sample=True,
+                temperature=args.dc_selfgen_temperature,
+                top_p=args.dc_selfgen_top_p,
+                top_k=0,
+                max_new_tokens=seqlen - 2,
+                min_new_tokens=seqlen - 2,
+                pad_token_id=tokenizer.eos_token_id)
+            out.append(gen[:, :seqlen].cpu())
+    remove_hooks(model)
+    ids = torch.cat(out)
+    sample = tokenizer.decode(ids[0, :80])
+    print(
+        f"[selfgen] generated {tuple(ids.shape)} tokens from the float model "
+        f"(T={args.dc_selfgen_temperature}, top_p={args.dc_selfgen_top_p}, random first token, "
+        f"seed {args.seed}); sample: {sample!r}")
+    return ids
+
+
+def setup_frozen_u(model, tokenizer, collate_fn, args, selfgen_ids=None):
+    """Load the frozen 2DP plane from --dc-u-path, or calibrate it (and save it if a path is set)."""
+    dev = next(model.parameters()).device
+    path = args.dc_u_path
+    if path and os.path.exists(path):
+        U = torch.load(path, map_location=dev)
+        set_frozen_u(model, U)
+        print(f"[frozen-U] loaded {tuple(U.shape)} from {path}")
+        return
+    mods = dc_modules(model)
+    for _, m in mods:
+        m.start_u_calibration()
+    if args.dc_u_calib == 'selfgen':
+        calib = selfgen_ids
+        for r in range(calib.size(0)):
+            model(input_ids=calib[r:r + 1].to(dev))
+        calname = "self-generated sequences (float model)"
+    elif args.dc_u_calib == 'random':
+        # Uniform random token ids over the regular vocabulary, BOS first as with
+        # --bos-preprocessing sequence.
+        gen = torch.Generator().manual_seed(args.seed)
+        vmax = min(getattr(tokenizer, "vocab_size", 128000), 128000)
+        cl = args.dc_u_calib_seqlen or args.seqlen
+        calib = torch.randint(0, vmax, (args.nsamples_rot_calibration, cl), generator=gen)
+        if args.bos_preprocessing is not None and tokenizer.bos_token_id is not None:
+            calib[:, 0] = tokenizer.bos_token_id
+        for r in range(calib.size(0)):
+            model(input_ids=calib[r:r + 1].to(dev))
+        calname = f"random tokens (uniform over {vmax} ids, calib seqlen {cl})"
+    else:
+        calib = get_dataset_for_model(
+            bos_preprocessing=args.bos_preprocessing,
+            dataset_name="wikitext2",
+            tokenizer=tokenizer,
+            nsamples=args.nsamples_rot_calibration,
+            seqlen=args.seqlen,
+            split="train",
+            seed=args.seed)
+        for b in DataLoader(dataset=calib, batch_size=1, collate_fn=collate_fn):
+            model(input_ids=b["input_ids"].to(dev))
+        calname = "WikiText-2 train windows"
+    stats = {idx: m.stop_u_calibration() for idx, m in mods}
+    U, eigfrac = build_frozen_u(
+        stats, basis=args.dc_u_basis, space=args.dc_u_space, pca_center=args.dc_u_pca_center)
+    U = U.to(dev)
+    set_frozen_u(model, U)
+    msg = (
+        f"[frozen-U] calibrated {tuple(U.shape)} on {len(calib)} {calname} (seqlen {args.seqlen}, "
+        f"seed {args.seed}), BOS position skipped; basis={args.dc_u_basis} space={args.dc_u_space}")
+    if eigfrac:
+        msg += (
+            f" centered={args.dc_u_pca_center} top-2 energy share "
+            f"mean {sum(eigfrac) / len(eigfrac):.4f} min {min(eigfrac):.4f}")
+    print(msg)
+    if path:
+        if os.path.dirname(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(U.cpu(), path)
+        print(f"[frozen-U] saved to {path}")
+    for ref_path in args.dc_u_ref:
+        R = torch.load(ref_path, map_location=dev).float()
+        if R.shape != U.shape:
+            print(
+                f"[frozen-U] overlap vs {ref_path} skipped: shape {tuple(R.shape)} != {tuple(U.shape)}"
+            )
+            continue
+        ov = (U.float().transpose(-2, -1) @ R).pow(2).sum(dim=(-2, -1)) / R.size(-1)
+        per_layer = ov.mean(dim=1)
+        print(
+            f"[frozen-U] overlap vs reference {ref_path}: mean {float(ov.mean()):.4f} "
+            f"min {float(ov.min()):.4f} (layer {int(ov.min(dim=1).values.argmin())})")
+        print(
+            "[frozen-U] vs-ref per-layer: " +
+            " ".join(f"L{l}:{float(v):.3f}" for l, v in enumerate(per_layer)))
+
+
+def print_u_overlap(model, tag):
+    """Print and reset the live-vs-frozen plane overlap ||U_live^T U_frozen||_F^2 / 2 per layer."""
+    per = u_overlap_logging(model, enable=True)
+    if not per:
+        return
+    vals = list(per.values())
+    print(
+        f"[frozen-U] overlap during {tag}: mean {sum(vals)/len(vals):.4f} min {min(vals):.4f} "
+        f"(layer {min(per, key=per.get)})")
+    print("[frozen-U] per-layer: " + " ".join(f"L{l}:{v:.3f}" for l, v in per.items()))
+
+
 def fused_rotation_no_fx(model, calibration_loader, args):
     with torch.no_grad(), rmsnorm_patch(model, model.config) as patcher:
         rmsnorm_classes = patcher.rmsnorm_classes
@@ -162,6 +394,7 @@ def fused_rotation_no_fx(model, calibration_loader, args):
         full_rotation_method=args.rotation_mode,
         return_rewriters=return_rewriters,
         sdpa_regions=args.rotation_sdpa_regions,
+        **sdpa_value_rotation_kwargs(args),
         use_parametrized_rotations=args.fine_tune,
         delay_rewriters=delay_rewriters,
         expansion_step=args.expansion_step,
@@ -370,7 +603,12 @@ def quantize_llm(args, extra_args=None):
         float_ppl = float_metrics.ppl
         float_probabilities = float_metrics.probabilities
         remove_hooks(model)
-        print(f"Float perplexity ({args.dataset}): {float_ppl:.3f}")
+
+    # Self-generated calibration text for the frozen 2DP plane, sampled before any transformation.
+    selfgen_ids = None
+    if (args.dc_extract_qk and args.dc_u_mode == 'frozen' and args.dc_u_calib == 'selfgen' and
+            not (args.dc_u_path and os.path.exists(args.dc_u_path))):
+        selfgen_ids = generate_selfgen_ids(model, tokenizer, args)
 
     rmsnorm_classes = ()
     if require_fx:
@@ -395,6 +633,10 @@ def quantize_llm(args, extra_args=None):
         apply_layernorm_to_rmsnorm(model)
         print("Layernorm To RMSNorm applied.")
 
+    if args.dc_extract_qk and args.rotation_sdpa_regions:
+        print("[dc-extract-qk] --rotation-sdpa-regions forced off: 2DP handles the Q/K head")
+        args.rotation_sdpa_regions = False
+
     # Insert standard MHA layers when performing fx based weight/act equalization to avoid dealing
     # with all the variability in HF implementations
     if args.quant_sdpa == 'fx':
@@ -417,12 +659,14 @@ def quantize_llm(args, extra_args=None):
             if any(map(lambda x: x in name, args.rotation_layers_to_expand)):
                 layers_to_expand.append(name)
 
+    print_rotation_summary(args)
     if args.rotation == 'fx':
         model = offload_model(model)
         eq = GraphRotationEqualization(
             orphan_sink=args.rotation_orphan_sink,
             full_rotation_method=args.rotation_mode,
             sdpa_regions=args.rotation_sdpa_regions,
+            **sdpa_value_rotation_kwargs(args),
             use_parametrized_rotations=args.fine_tune,
             expansion_step=args.expansion_step,
             layers_to_expand=layers_to_expand,
@@ -447,6 +691,11 @@ def quantize_llm(args, extra_args=None):
             rotation_block_size=args.rotation_block_size)
         model = eq.apply(model)
         remove_hooks(model)
+
+    # make_dynamo_compatible (fused_no_fx rotation) resets the attention implementation; restore the
+    # quantizable eager attention, otherwise the QK^T quantizers are bypassed.
+    if args.quant_sdpa == 'eager':
+        model.config._attn_implementation = 'quant_sdpa'
 
     if args.weight_equalization:
         print("Apply weight equalization...")
@@ -534,6 +783,17 @@ def quantize_llm(args, extra_args=None):
             scaling_min_val=args.scaling_min_val,
             weight_kwargs=weight_kwargs,
             input_kwargs=input_kwargs)
+        if args.no_quantize_linear:
+            # Attention quantizers only: they are built from the input_* options, the linear ones
+            # built alongside are dropped here.
+            assert quantizers_dict['k_transposed_quant'] is not None, \
+                "--no-quantize-linear needs attention quantizers: set input_bit_width (and attn_*)"
+            quantizers_dict['linear_input_quant'] = None
+            quantizers_dict['input_quant'] = None
+            quantizers_dict['weight_quant'] = None
+            print(
+                "[qk-only] linear weights and inputs NOT quantized; attention quantizers kept "
+                f"(attn_quant_config={args.attn_quant_config})")
         if args.custom_quantizer is not None:
             quantizer_name = parse_custom_quantizer(args.custom_quantizer)
             custom_quantizer = QUANTIZERS_REGISTRY.get(quantizer_name)
@@ -541,11 +801,25 @@ def quantize_llm(args, extra_args=None):
         # Quantize the embedding only when first/last-layer quantization is requested.
         # The embedding uses the same weight quantizer as the linear layers.
         # A custom quantizer that branches on module name or type still applies.
+        dc_extract_kwargs = None
+        if args.dc_extract_qk:
+            dc_extract_kwargs = dict(
+                num_key_value_heads=getattr(config, 'num_key_value_heads', None),
+                dc_sub_dim=args.dc_sub_dim,
+                dc_correction=args.dc_correction,
+                dc_gamma=args.dc_gamma,
+                dc_abar_mode=args.dc_abar_mode,
+                dc_sinkbal=args.dc_sinkbal,
+                dc_had_rand=args.dc_had_rand,
+                dc_had_rand_shared=args.dc_had_rand_shared,
+                dc_had_seed=args.dc_had_seed,
+                tcast_scale=args.dc_tcast_scale)
         layer_map = generate_quant_maps(
             **quantizers_dict,
             dtype=dtype,
             device=device,
-            quantize_embedding=args.quantize_first_last_layer)
+            quantize_embedding=args.quantize_first_last_layer,
+            dc_extract_kwargs=dc_extract_kwargs)
         if not args.quantize_first_last_layer:
             # Dynamo tracing changes the name of the modules, thus we need this workaround to pick
             # up the last module.
@@ -570,6 +844,18 @@ def quantize_llm(args, extra_args=None):
 
         model = layerwise_quantize(
             model=model, compute_layer_map=layer_map, name_blacklist=name_blacklist)
+
+        if args.dc_extract_qk:
+            assign_layer_ids(model)
+            if args.dc_had_layers:
+                mods = dc_modules(model)
+                had_layers = parse_layer_list(args.dc_had_layers, len(mods))
+                for idx, m in mods:
+                    if idx in had_layers:
+                        m.dc_sub_dim = -1
+                print(
+                    f"[dc-hybrid] Q/K Hadamard (dc_sub_dim=-1) at layers {sorted(had_layers)}, "
+                    f"2DP (dc_sub_dim={args.dc_sub_dim}) elsewhere")
 
         if custom_quantizer is not None:
             model = custom_quantizer.post_process_quant_model(model)
@@ -771,10 +1057,25 @@ def quantize_llm(args, extra_args=None):
         # by the zero shot evaluation libraries (e.g., LightEvel), so we remove the `weight_orig` tensors
         # here, if they exist, to save memory.
         remove_weight_orig(model)
+        frozen_u_pending = args.dc_extract_qk and args.dc_u_mode == 'frozen' and not args.no_quantize
         if args.eval and not args.no_quantize:
             print("Model eval...")
             with torch.no_grad(), quant_inference_mode(model, compile=args.compile_eval):
                 model(**next(iter(calibration_loader)))
+                if frozen_u_pending:
+                    setup_frozen_u(model, tokenizer, collate_fn, args, selfgen_ids)
+                    u_overlap_logging(model, enable=True)
+                    frozen_u_pending = False
+                if args.sqnr_decomp > 0:
+                    from brevitas_examples.llm.sqnr_decomp import run_sqnr_decomp
+                    run_sqnr_decomp(
+                        model,
+                        validation_loader,
+                        n_chunks=args.sqnr_decomp,
+                        ctx_len=args.seqlen // 2,
+                        device=next(model.parameters()).device,
+                        tag=f"dc_sub_dim={args.dc_sub_dim}",
+                        mf_gamma=args.mf_probe_gamma)
                 quant_metrics = compute_quantized_evaluation_metrics(
                     model=model,
                     data=validation_loader,
@@ -782,6 +1083,7 @@ def quantize_llm(args, extra_args=None):
                     tokenizer=tokenizer,
                     reference_probabilities=float_probabilities,
                     seed=args.seed)
+                print_u_overlap(model, "ppl")
             quant_ppl = quant_metrics.ppl
             # NOTE: EAR and KLD are by default normalized by reference top-K probability mass.
             quant_ear = quant_metrics.ear
@@ -799,6 +1101,10 @@ def quantize_llm(args, extra_args=None):
             from lm_eval.models.huggingface import HFLM
             with torch.no_grad(), quant_inference_mode(model, compile=args.compile_eval):
                 model(**next(iter(calibration_loader)))
+                if frozen_u_pending:
+                    setup_frozen_u(model, tokenizer, collate_fn, args, selfgen_ids)
+                    u_overlap_logging(model, enable=True)
+                    frozen_u_pending = False
                 batch_size = 'auto' if args.few_shot_override_batch_size is None else args.few_shot_override_batch_size
                 wrapped_model = HFLM(
                     pretrained=model,
@@ -811,12 +1117,19 @@ def quantize_llm(args, extra_args=None):
                     device='cuda:0',
                     limit=args.few_shot_limit,
                     num_fewshot=0 if args.few_shot_zeroshot else None,
-                    log_samples=False,
+                    log_samples=args.few_shot_samples_out is not None,
                     batch_size=None,
                     verbosity="ERROR")
+            if args.few_shot_samples_out is not None:
+                dump_few_shot_samples(few_shot_eval_results, args.few_shot_samples_out)
             few_shot_eval_results = filter_results(few_shot_eval_results, args.few_shot_tasks)
             print("Few shot eval results")
             pprint.pprint(few_shot_eval_results)
+            zeroshot_avg = compute_zeroshot_avg(few_shot_eval_results, args.few_shot_tasks)
+            if zeroshot_avg is not None:
+                few_shot_eval_results['zeroshot_avg'] = zeroshot_avg
+                print(f"Zero-shot avg ({len(args.few_shot_tasks)} tasks): {zeroshot_avg:.4f}")
+            print_u_overlap(model, "zero-shot")
         elif args.few_shot_eval == 'lighteval':
 
             with torch.no_grad(), quant_inference_mode(model, compile=args.compile_eval):
