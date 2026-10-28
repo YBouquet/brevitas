@@ -10,6 +10,8 @@ The method lives in the LLM example:
 | `llm/mf_probe.py` | `--mf-probe-gamma`, `--dc-sinkbal`: sink diagnostics |
 | `graph/equalize.py` | `had_rand` rotation mode and the `sdpa_value_*` options (R2 policy) |
 
+The gfx950 kernels and the 2DP vs Hadamard latency benchmark are in [`kernels/`](kernels/README.md).
+
 ## Method
 
 After RoPE, the token mean of Q and K concentrates in the slow (low-frequency) half of the head.
