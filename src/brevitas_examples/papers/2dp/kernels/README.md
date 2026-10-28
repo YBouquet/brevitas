@@ -48,22 +48,36 @@ python bench_2dp_vs_hadamard.py --model 8b --u-path U_selfgen_8b_2dp_allrand_s0.
 Activations and weights are random fp16. At the first T, both pipelines are checked against the torch
 references: fp4 code mismatch, and logits relative L2 (about 1e-2, from rounding ties).
 
-Each pipeline is timed end to end with `triton.testing.do_bench` (median), from the projection to the fp32
-logits. Stage times are also reported. Both QK^T kernels are autotuned over the same tile candidates.
+Timing uses `triton.testing.do_bench` (warmup 25 ms, timing budget 100 ms). It flushes L2 before every run
+and returns the median, so the number of timed runs depends on the kernel's duration: about 45 at 2 ms,
+several hundred at 0.1 ms.
+
+- **Tile selection.** For each pipeline, the QK^T variant and tile are picked on the end-to-end chain
+  (projection → QK^T), from the same 8 candidates. A QK^T kernel timed alone after the L2 flush does not
+  rank the tiles as they run behind the front end. Picking tiles alone flipped the 8B T = 8192 result
+  between jobs.
+- **Repeats.** The two pipelines and their front ends are then timed in `--repeats` interleaved repeats
+  (default 5). The table gives the median and the range of the per-repeat ratio.
 
 ## Results
 
-MI350X, end to end, in µs, from this code:
+MI350X, end to end, in µs, median of 5 interleaved repeats. The last column gives each 2DP vs Hadamard
+ratio with the [min, max] of the per-repeat ratio.
 
-| T | Llama-3.2-1B: 2DP | 1B: Hadamard | Llama-3.1-8B: 2DP | 8B: Hadamard |
+| model | T | 2DP | Hadamard | 2DP vs Hadamard |
 |---|---|---|---|---|
-| 1024 | 87.5 | 88.1 | **130.3** | 133.9 |
-| 2048 | 173.6 | 173.8 | **228.6** | 240.4 |
-| 4096 | 521.8 | 524.9 | **671.1** | 684.2 |
-| 8192 | 1899.9 | 1933.4 | 2210.6 | 2174.8 |
+| Llama-3.2-1B | 1024 | 87.6 | 87.6 | 0.0 % [−0.1, +0.1] |
+| Llama-3.2-1B | 2048 | **168.7** | 173.9 | −3.0 % [−3.4, −2.9] |
+| Llama-3.2-1B | 4096 | **515.9** | 523.6 | −1.5 % [−1.6, −1.3] |
+| Llama-3.2-1B | 8192 | **1900.3** | 1935.3 | −1.8 % [−1.9, −1.8] |
+| Llama-3.1-8B | 1024 | **130.6** | 133.6 | −2.2 % [−2.4, −2.1] |
+| Llama-3.1-8B | 2048 | **228.3** | 234.6 | −2.6 % [−2.7, −2.6] |
+| Llama-3.1-8B | 4096 | **654.6** | 672.2 | −2.6 % [−2.8, −2.6] |
+| Llama-3.1-8B | 8192 | 2223.4 | **2169.6** | +2.4 % [+2.2, +2.6] |
 
-- **Front end:** the 2DP P1 is 9–25 % faster than Hadamard's J1 + J2 (1B: 52–111 vs 57–148 µs; 8B: 93–382
-  vs 105–436 µs), because RoPE, the plane and MXFP4 all run in the GEMM epilogue.
-- **QK^T:** the rank-2 term costs −1 % to +4 %.
-- **Large T:** both pipelines are bound by the fp32 logit store, which is ~4.8 TB/s at T = 8192 and the same
-  for both. Run-to-run noise there is ±2–3 %, which covers the 8B T = 8192 difference.
+- **Front end.** The 2DP P1 is 3–25 % faster than Hadamard's J1 + J2, because RoPE, the plane and MXFP4 all
+  run in the GEMM epilogue.
+- **QK^T.** Measured inside the chain, the rank-2 term costs about 0 % at 1B. At 8B it costs up to 6 %
+  (1841 vs 1730 µs at T = 8192). That cost grows with T², while the front-end saving grows with T. At
+  8B T = 8192 the QK^T cost wins.
+- **Large T.** Both pipelines are bound by the fp32 logit store.

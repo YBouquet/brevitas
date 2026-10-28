@@ -9,7 +9,8 @@
             J2 = had_j2.rope_quant_hd: RoPE + H_D / sqrt(D) + MXFP4 (Triton)
             P2 = p2_qk.qk(corr=0): bare fp4 QK^T
 Endpoint: fp32 logits [n_q, T, T] of all Q heads, no 1/sqrt(D) (owned by flash attention). The 2DP output
-is (1-g) S: 1/(1-g) joins the softmax scale. Both QK^T kernels are autotuned over the same tile candidates.
+is (1-g) S: 1/(1-g) joins the softmax scale. For each pipeline the QK^T variant and tile are picked on the
+end-to-end chain (same 8 candidates); the two pipelines are then timed in --repeats interleaved repeats, median.
 
     python bench_2dp_vs_hadamard.py --model 8b --ts 1024 2048 4096 8192 \
         --u-path U_selfgen_8b_2dp_allrand_s0.pt --u-layer 15 --out bench_8b.json
@@ -25,6 +26,7 @@ import argparse
 import json
 import math
 import os
+import statistics
 import sys
 
 import torch
@@ -36,8 +38,8 @@ from layout_2dp import permute_fused_qkv_split_rope_hd
 from layout_2dp import rope_tables_hd
 from layout_2dp import ublk_constants
 from p1_2dp import front_end_2dp
+from p2_qk import CANDS
 from p2_qk import qk
-from p2_qk import tune_qk
 from reference import mx_quant
 from reference import ref_2dp
 from reference import ref_logits
@@ -177,6 +179,7 @@ def main():
     ap.add_argument(
         "--u-path", default=None, help="frozen plane [L, n_kv, D/2, 2] (--dc-u-path file)")
     ap.add_argument("--u-layer", type=int, default=15)
+    ap.add_argument("--repeats", type=int, default=5, help="interleaved repeats per T (median)")
     ap.add_argument("--out", default=None, help="write the results as JSON")
     args = ap.parse_args()
     dev = "cuda"
@@ -186,34 +189,67 @@ def main():
     print(
         f"{cfg['name']} on {result['device']}, gamma={args.gamma}, U from {args.u_path or 'random'}"
     )
-    hdr = f"{'T':>6} {'2DP':>9} {'Hadamard':>9} {'2DP vs Had':>10} | {'P1 2DP':>8} {'J1+J2':>8} | {'P2 2DP':>8} {'P2 Had':>8}"
+    hdr = (
+        f"{'T':>6} {'2DP':>9} {'Hadamard':>9} {'2DP vs Had':>10} {'range':>16} | {'P1 2DP':>8} "
+        f"{'J1+J2':>8} | {'P2 2DP':>8} {'P2 Had':>8}")
     for i, T in enumerate(args.ts):
         s = build(cfg, T, U, dev)
         p1, p2 = pipes(cfg, s, args.gamma)
-        st, cfgs = {}, {}
         p1["p1_2dp"]()
         p1["j1"]()
-        p1["j2"]()  # fill the QK^T inputs before tuning
+        p1["j2"]()  # fill the QK^T inputs
         torch.cuda.synchronize()
-        for k, (a, kw) in p2.items():
-            cfgs[k], st[k] = tune_qk(med_us, a, kw)
-        for k, fn in p1.items():
-            st[k] = med_us(fn)
-        k2 = min(("qk_2dp_mfma", "qk_2dp_valu"), key=st.get)
-        run = lambda k: (lambda: qk(*p2[k][0], **p2[k][1], cfg=cfgs[k]))
-        q2, qh = run(k2), run("qk_had")
-        e2e = dict(
-            twodp=med_us(lambda: (p1["p1_2dp"](), q2())),
-            hadamard=med_us(lambda: (p1["j1"](), p1["j2"](), qh())))
-        r = dict(stage=st, e2e=e2e, qk_cfg=cfgs, qk_2dp=k2)
+        fe = dict(twodp=p1["p1_2dp"], hadamard=lambda: (p1["j1"](), p1["j2"]()))
+
+        def chain(f, k, c):
+            a, kw = p2[k]
+            return lambda: (fe[f](), qk(*a, **kw, cfg=c))
+
+        # QK^T variant and tile picked on the END-TO-END chain: a QK^T kernel timed alone after the L2 flush
+        # does not rank the tiles as they run behind the front end
+        tune = {}
+        for f, ks in (("twodp", ("qk_2dp_mfma", "qk_2dp_valu")), ("hadamard", ("qk_had",))):
+            cands = []
+            for k in ks:
+                for c in CANDS:
+                    try:
+                        cands.append((med_us(chain(f, k, c)), k, c))
+                    except Exception as e:  # noqa: BLE001
+                        print(f"  [{k} {c} skipped: {type(e).__name__}]")
+            tune[f] = min(cands)[1:]
+        best = {f: chain(f, *tune[f]) for f in fe}
+        # interleaved repeats of the two pipelines and their stages
+        fns = dict(best, fe_twodp=fe["twodp"], fe_hadamard=fe["hadamard"])
+        names = list(fns)
+        t = {n: [] for n in names}
+        for r in range(args.repeats):
+            for n in (names if r % 2 == 0 else names[::-1]):
+                t[n].append(med_us(fns[n]))
+        md = {n: statistics.median(v) for n, v in t.items()}
+        ratio = [100 * (a / b - 1) for a, b in zip(t["twodp"], t["hadamard"])]
+        r = dict(
+            e2e=dict(twodp=md["twodp"], hadamard=md["hadamard"]),
+            e2e_all=dict(twodp=t["twodp"], hadamard=t["hadamard"]),
+            front_end=dict(twodp=md["fe_twodp"], hadamard=md["fe_hadamard"]),
+            qk_in_chain=dict(
+                twodp=md["twodp"] - md["fe_twodp"], hadamard=md["hadamard"] - md["fe_hadamard"]),
+            twodp_vs_had_pct=dict(median=statistics.median(ratio), min=min(ratio), max=max(ratio)),
+            qk=dict(twodp=list(tune["twodp"]), hadamard=list(tune["hadamard"])))
         if i == 0:
-            r["check"] = check(cfg, s, p1, p2, cfgs, U, args.gamma)
+            tiles = dict(
+                qk_2dp_mfma=tune["twodp"][1],
+                qk_2dp_valu=tune["twodp"][1],
+                qk_had=tune["hadamard"][1])
+            r["check"] = check(cfg, s, p1, p2, tiles, U, args.gamma)
             print("check:", {k: f"{v:.3e}" for k, v in r["check"].items()})
             print(hdr)
+        q = r["qk_in_chain"]
+        rr = r["twodp_vs_had_pct"]
         print(
-            f"{T:>6} {e2e['twodp']:>9.1f} {e2e['hadamard']:>9.1f} "
-            f"{100 * (e2e['twodp'] / e2e['hadamard'] - 1):>+9.1f}% | {st['p1_2dp']:>8.1f} "
-            f"{st['j1'] + st['j2']:>8.1f} | {st[k2]:>8.1f} {st['qk_had']:>8.1f}",
+            f"{T:>6} {md['twodp']:>9.1f} {md['hadamard']:>9.1f} {rr['median']:>+9.1f}% "
+            f"[{rr['min']:+5.1f}, {rr['max']:+5.1f}] | {md['fe_twodp']:>8.1f} {md['fe_hadamard']:>8.1f} | "
+            f"{q['twodp']:>8.1f} {q['hadamard']:>8.1f}   ({tune['twodp'][0]} {tune['twodp'][1]}, "
+            f"had {tune['hadamard'][1]})",
             flush=True)
         result["runs"][T] = r
         del s
