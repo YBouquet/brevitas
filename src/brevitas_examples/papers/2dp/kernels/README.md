@@ -12,6 +12,9 @@ folded unshrink against the standard Hadamard pipeline.
 | `layout_2dp.py` | offline: weight column permutation, RoPE tables, per-tile plane tables |
 | `reference.py` | torch fp32 references for the correctness check |
 | `bench_2dp_vs_hadamard.py` | the benchmark |
+| `bench_rank2_variants.py` | the three rank-2 variants against Hadamard at one (model, T): correctness, end-to-end tile sweep, interleaved repeats |
+| `p2_fa_stats.py` | P2, flash-attention endpoint (Gluon): fp4 QK^T (+ rank-2 term) consumed by an online softmax; only the row max `m` and row sum `l` are written, no logits |
+| `bench_fa_proxy.py` | the benchmark with `p2_fa_stats` as P2 (see [Flash-attention endpoint](#flash-attention-endpoint)) |
 
 ```
 2DP       P1: x @ W -> RoPE -> a = U^T x_LF, r = x - U a -> MXFP4(r), a' = (1-gamma) a     one kernel
@@ -83,3 +86,123 @@ interleaved repeats. The last column lists the 2DP vs Hadamard ratio of each of 
   ±1 % between jobs, so 1B is a tie there and 8B a small win.
 - **The `NL` loop** brought 8B T = 8192 from +2.4 % (one tile per program) to −0.4 … −0.9 %; the best 2DP
   tile there is (256, 64, 4, 4, 1, NL = 2).
+
+## The rank-2 term: MFMA, FMA or `v_dot2`
+
+The fp4 product runs on the matrix core (`mfma_scaled`) in both pipelines. 2DP adds `a'.b`, a K = 2 product
+per logit. `p2_qk.qk(corr=1, corr_mfma=...)` computes it in one of three ways:
+
+| `corr_mfma` | variant | per logit | coefficient loads |
+|---|---|---|---|
+| 1 | MFMA | none on the VALU; one fp16 `32x32x16` MFMA per 32x32 sub-tile (`a'`, `b` padded with zeros from K = 2 to 16), accumulating into the fp4 accumulator | padded `[BM, 16]`, `[16, BN]` |
+| 0 | FMA | 2 `v_fma_f32` on the accumulator's row and column slices | 4 fp16 loads, converted to fp32 |
+| 2 | `v_dot2` | 1 `v_dot2_f32_f16`: `acc += a'0 b0 + a'1 b1` | one int32 (the packed fp16 pair P1 stores) per row and per column |
+
+`v_dot2_f32_f16 D, A, B, C` computes `D = A.lo * B.lo + A.hi * B.hi + C`, with A and B fp16 pairs packed in
+32 bits and C, D in fp32. Triton does not emit it, so `p2_qk.py` issues it through `inline_asm_elementwise`.
+The fp16 products are exact in fp32. Against the FMA variant it differs by at most 7.6e-6 on logits up to 70,
+with the same error against the reference.
+
+T = 8192, end to end vs Hadamard, each variant on its best end-to-end tile; median of 5 interleaved repeats
+in one job, with the [min, max] of the per-repeat ratio (jobs 91172 / 91173):
+
+| | Hadamard (µs) | MFMA | FMA | `v_dot2` |
+|---|---|---|---|---|
+| Llama-3.2-1B | 1903.3 | +0.42 % [−3.58, +0.46] | **+0.01 %** [−3.92, +0.18] | +1.00 % [−2.88, +1.11] |
+| Llama-3.1-8B | 2176.6 | +0.44 % [+0.36, +0.56] | +1.84 % [+1.49, +1.95] | **+0.07 %** [−0.08, +0.20] |
+
+- **No clear winner.**
+  - At 8B, `v_dot2` beats the FMA variant (1797 vs 1836 µs QK^T inside the chain) and matches the MFMA one.
+  - At 1B, it is the slowest of the three.
+- **None of the three beats Hadamard in this job.** At T = 8192 the 2DP vs Hadamard result moves by about
+  ±1 % between jobs: the same 8B MFMA configuration was −0.4 to −0.9 % in the 3 jobs of the results table
+  above.
+- **The remaining QK^T gap is not the rank-2 arithmetic.** At a matched tile, 2DP's QK^T costs the same as
+  Hadamard's (1770 vs 1771 µs at 8B, tile (256, 64, 4, 4, 1, 2)). The gap comes from Hadamard's best tile,
+  (128, 128, 4, 4, 1, 1) at 8B, at which every 2DP variant is slow.
+- **Tuning.** `bench_2dp_vs_hadamard.py` tunes over all three variants end to end. The results table above
+  was measured before `v_dot2` was added, over MFMA and FMA only.
+
+
+## Flash-attention endpoint
+
+The results above end at the fp32 logit store, which bounds both pipelines at large T. Flash attention never
+writes the logits, so the rank-2 term is no longer hidden behind the store. Two endpoints were measured on
+Llama-3.1-8B / Llama-3.2-1B shapes, MI350X.
+
+### QK^T + online softmax (`bench_fa_proxy.py`)
+
+P2 = `p2_fa_stats.qk_stats`: fp4 QK^T, rank-2 term, exact online softmax (row max and row sum), `m` and `l`
+stored. P.V is omitted. Each method is tuned on the end-to-end chain over the rank-2 variants and tiles; median
+of 5 interleaved repeats, one job (91651). `m` / `l` match the torch reference (max rel 7e-7).
+
+| model | T | 2DP (µs) | Hadamard (µs) | 2DP vs Hadamard | P2 2DP / Had | front end 2DP / Had |
+|---|---|---|---|---|---|---|
+| 8B | 1024 | **114.4** | 117.9 | −2.9 % | 27.5 / 25.2 | 91.3 / 97.0 |
+| 8B | 2048 | **172.7** | 182.4 | −5.3 % | 72.8 / 67.1 | 109.0 / 124.2 |
+| 8B | 4096 | **461.2** | 463.6 | −0.5 % | 259.2 / 236.4 | 216.9 / 248.4 |
+| 8B | 8192 | 1447.0 | 1373.5 | +5.4 % | 992.2 / 900.5 | 382.5 / 440.8 |
+| 8B | 16384 | 5020.7 | 4772.0 | +5.3 % | 3885.0 / 3513.0 | 770.3 / 885.6 |
+| 1B | 1024 | **71.0** | 71.7 | −1.0 % | 22.3 / 21.5 | 52.2 / 53.9 |
+| 1B | 2048 | 109.0 | 107.0 | +1.8 % | 61.5 / 53.4 | 51.8 / 57.3 |
+| 1B | 4096 | 271.0 | 248.6 | +8.9 % | 220.8 / 181.4 | 58.3 / 71.8 |
+| 1B | 8192 | 983.5 | 853.1 | +15.3 % | 849.8 / 681.7 | 112.0 / 144.7 |
+| 1B | 16384 | 3601.3 | 3078.9 | +16.1 % | 3337.3 / 2644.3 | 207.2 / 272.5 |
+
+- **The rank-2 cost becomes visible.** Without the store, P2 is no longer memory-bound: 2DP's P2 is 8–11 %
+  slower at 8B and 4–26 % at 1B (head_dim 64: the fp4 MFMA work per logit is half, the rank-2 work is not).
+- This kernel computes the softmax only, and its issue schedule is the compiler's. The full kernel below shows
+  that the gap is mostly a scheduling / load-path effect, not the rank-2 arithmetic.
+
+### Full flash attention (not yet in this repo)
+
+Kernel: the gfx950 Gluon tutorial `fmha_v3` (rotated 4-cluster warp-pipelined loop, eager online-softmax
+rescale, P.V in fp16 with V through LDS, fp16 O + LSE stores), with the QK^T replaced by the MXFP4
+`mfma_scaled` and, for 2DP, the rank-2 term. Softmax scale `1/sqrt(D)` (Hadamard) or `1/(sqrt(D)(1-gamma))`
+(2DP). Non-causal, B = 1, 32 Q / 8 KV heads, D = 128. O matches torch (rel L2 2.8e-4 for both methods).
+The code is at `/shared/ybouquet/rope_frozen/analysis/{fmha_mx,fa_nocvt,fa_coefpref,fa_roof}/`; it depends on
+the tutorial sources and a newer Triton build (see [Toolchain](#toolchain-scheduler-plugin-and-fmha_v4)) and
+will be added here once the variants settle.
+
+Llama-3.1-8B, T = 8192, FA kernel alone, µs, median of 5 interleaved repeats. Every K-path change is applied
+to both methods; the comparison is always fastest Hadamard against fastest 2DP.
+
+| K path | Hadamard | 2DP | 2DP vs Hadamard | job |
+|---|---|---|---|---|
+| K in registers, global loads in mem1 (first port) | 1256 | 1434 | +14 % | 92059 |
+| same, rank-2 as fp16 32x32x16 MFMA with the fp4 accumulator as srcC, scales loaded first | 1166 | 1198 | +2.8 % | 91982 |
+| K through LDS, prefetched (`lds3`) | 1027 | 1073 | +4.8 % | 92012 |
+| **K through LDS with direct-to-LDS loads, tutorial schedule (`L`)** | **959** | **1005** | **+4.7 %** | 92078 |
+
+End to end (front end + FA kernel), the 2DP front end is 58 µs cheaper (388 vs 446 µs at T = 8192): 2DP is
+level with Hadamard at T = 8192 (+0.6 % [−0.0, +0.9] measured with `lds3`; about −0.9 % estimated with `L`),
+and faster at T ≤ 4096 (−3.5 % at 4096, −5.6 % at 2048 with the job 91982 variant).
+
+Where the overhead came from (switch-off ablations, wrong outputs, diagnostic only; T = 8192):
+
+- **Not the MFMA or VALU throughput.** The kernel runs at 23–25 % MFMA utilization. Removing exp or the
+  rescale leaves the 2DP gap at 12–13 %.
+- **The K loads.** In the first port every one of the 8 waves loads the whole K tile from global memory with
+  lanes = tokens (token stride `n_heads * 64` B): each `global_load_dwordx4` touches 32 cache lines, plus the
+  scale loads and, for 2DP, the coefficient loads. Removing the in-loop K loads takes Hadamard from 1256 to
+  797 µs and leaves 2DP only +2.7 % slower. Staging K once per workgroup in LDS (`L`) fixes this for both
+  methods (Hadamard −24 %).
+- **What remains** with `L` is ~45 µs (+4.7 %), spread over the loop: with K loads removed +3.2 %, with exp
+  and rescale removed +3.9 %, with K and V loads removed +2.2 %.
+
+### Toolchain: scheduler plugin and `fmha_v4`
+
+The tutorial's `fmha_v4` and the LLIR scheduler plugin aborted with `LLVM ERROR: Option 'default' already
+exists!`. Cause: `libtriton.so` exports its LLVM with default visibility, and the ROCm SDK `libLLVM.so.23`
+(loaded by `libamd_comgr` when HIP initializes) binds its data references to libtriton's copy, so its static
+constructors register the same `cl::opt` twice. The plugin is not involved; the same clash explains the
+torch-before-triton crash and the `rocprofv3` segfault.
+
+Fix, with Triton tag v2.0 (has `warp_predicate`):
+- `TRITON_BACKENDS_IN_TREE=1` (v2 otherwise finds 0 drivers when installed through a `.pth`).
+- A copy of the plugin with `patchelf --add-needed libtriton.so --set-rpath <triton>/python/triton/_C`.
+- Import triton with `RTLD_LOCAL` first, then torch, then preload the plugin with `RTLD_LOCAL | RTLD_DEEPBIND`.
+
+Tutorial fp16 attention, N = 8192, MI350X, outputs correct: `fmha_v4` 912 → 1023 TF/s with the plugin,
+`fmha_v3` 874 → 953 TF/s. On the first MXFP4 port the plugin cut the 2DP vs Hadamard FA gap from +9.1 % to
++6.3 % (job 91978).

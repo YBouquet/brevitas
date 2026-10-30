@@ -4,7 +4,7 @@
 """2DP vs Hadamard latency on gfx950: QKV projection -> RoPE -> transform -> MXFP4 -> QK^T logits.
 
   2DP       P1 = p1_2dp.front_end_2dp(epi=1): GEMM + RoPE + frozen-plane extraction + MXFP4, a' = (1-g) a
-            P2 = p2_qk.qk(corr=1): fp4 QK^T + a'.b (rank-2 on the matrix core or the VALU, faster one)
+            P2 = p2_qk.qk(corr=1): fp4 QK^T + a'.b (rank-2 as MFMA, 2 FMAs or v_dot2: fastest end to end)
   Hadamard  J1 = p1_2dp.front_end_2dp(epi=0): the same GEMM, fp16 Q/K/V store
             J2 = had_j2.rope_quant_hd: RoPE + H_D / sqrt(D) + MXFP4 (Triton)
             P2 = p2_qk.qk(corr=0): bare fp4 QK^T
@@ -128,6 +128,7 @@ def pipes(cfg, s, gamma):
     p2 = dict(
         qk_2dp_mfma=(a2 + (gpg, D), dict(corr=1, corr_mfma=True)),
         qk_2dp_valu=(a2 + (gpg, D), dict(corr=1, corr_mfma=False)),
+        qk_2dp_dot2=(a2 + (gpg, D), dict(corr=1, corr_mfma=2)),
         qk_had=(ah + (gpg, D), dict(corr=0)))
     return p1, p2
 
@@ -151,7 +152,7 @@ def check(cfg, s, p1, p2, cfgs, U, gamma):
     res["2dp_code_mismatch"] = (codes != cref).float().mean().item()
     target = ref_logits(
         dref[:, :n_q], dref[:, n_q:], gpg, a[:, :n_q], a[:, n_q:], 1.0 / (1.0 - gamma))
-    for k in ("qk_2dp_mfma", "qk_2dp_valu"):
+    for k in ("qk_2dp_mfma", "qk_2dp_valu", "qk_2dp_dot2"):
         args, kw = p2[k]
         qk(*args, **kw, cfg=cfgs[k])
         torch.cuda.synchronize()
@@ -209,7 +210,7 @@ def main():
         # QK^T variant and tile picked on the END-TO-END chain: a QK^T kernel timed alone after the L2 flush
         # does not rank the tiles as they run behind the front end
         tune = {}
-        for f, ks in (("twodp", ("qk_2dp_mfma", "qk_2dp_valu")), ("hadamard", ("qk_had",))):
+        for f, ks in (("twodp", ("qk_2dp_mfma", "qk_2dp_valu", "qk_2dp_dot2")), ("hadamard", ("qk_had",))):
             cands = []
             for k in ks:
                 for c in [c for c in tiles(D) if T % (c[1] * c[5]) == 0 and T % c[0] == 0]:
@@ -240,6 +241,7 @@ def main():
             best_tiles = dict(
                 qk_2dp_mfma=tune["twodp"][1],
                 qk_2dp_valu=tune["twodp"][1],
+                qk_2dp_dot2=tune["twodp"][1],
                 qk_had=tune["hadamard"][1])
             r["check"] = check(cfg, s, p1, p2, best_tiles, U, args.gamma)
             print("check:", {k: f"{v:.3e}" for k, v in r["check"].items()})

@@ -10,8 +10,11 @@ whole head (D/2 packed bytes, D/32 E8M0 scales) is one `mfma_scaled` (e2m1 x e2m
 AMDMFMALayout accumulator: no K loop. Operands are fp4 packed bytes with k_width = 16.
 CORR (constexpr): 0 = bare fp4 QK^T (Hadamard baseline); 1 = 2DP: R + a'.b with a' = (1-gamma) a stored
 by P1 (folded unshrink: the output is (1-gamma) S, and 1/(1-gamma) joins the softmax scale).
-CORR_MFMA: the rank-2 term as one padded fp16 32x32x16 MFMA into the same accumulator (1), or as VALU FMAs
-on the accumulator's row / column slices (0). No 1/sqrt(D): flash attention owns the softmax scale.
+CORR_MFMA: how the rank-2 term is computed:
+  0  two VALU FMAs per logit on the accumulator's row / column slices (a', b converted to fp32);
+  1  one padded fp16 32x32x16 MFMA per 32x32 sub-tile, accumulating into the same accumulator;
+  2  one v_dot2_f32_f16 per logit: acc += a'0 b0 + a'1 b1 from the packed fp16 pairs (inline asm).
+No 1/sqrt(D): flash attention owns the softmax scale.
 Output: fp32 logits [n_q, T, T].
 """
 
@@ -49,11 +52,16 @@ def _k_side(
     msb = gl.arange(0, BN, layout=gl.SliceLayout(1, blk_s)) + n0
     nsa = gl.arange(0, NS, layout=gl.SliceLayout(0, blk_s))
     ks = gl.convert_layout(gl.load(KS + hk * sks_h + msb[:, None] * sks_t + nsa[None, :]), sc_b)
-    if CORR != 0 and CORR_MFMA:
+    if CORR != 0 and CORR_MFMA == 1:
         kk = gl.arange(0, 16, layout=gl.SliceLayout(1, cb))
         nk = gl.arange(0, BN, layout=gl.SliceLayout(0, cb)) + n0
         kc0 = gl.load(
             KC + hk * skc_h + nk[None, :] * skc_t + kk[:, None], mask=(kk < 2)[:, None], other=0.0)
+        kc1 = kc0
+    elif CORR != 0 and CORR_MFMA == 2:
+        nc = gl.arange(0, BN, layout=gl.SliceLayout(0, mfl)) + n0
+        kc0 = gl.load(
+            KC.to(gl.pointer_type(gl.int32)) + (hk * skc_h + nc * skc_t) // 2)  # (b0, b1) fp16
         kc1 = kc0
     elif CORR != 0:
         nc = gl.arange(0, BN, layout=gl.SliceLayout(0, mfl)) + n0
@@ -126,11 +134,14 @@ def gl_qk(
     nsa = gl.arange(0, NS, layout=gl.SliceLayout(0, blk_s))
     qs = gl.convert_layout(gl.load(QS + hq * sqs_h + msa[:, None] * sqs_t + nsa[None, :]), sc_a)
     mc = gl.arange(0, BM, layout=gl.SliceLayout(1, mfl)) + m0
-    if CORR != 0 and CORR_MFMA:
+    if CORR != 0 and CORR_MFMA == 1:
         mq = gl.arange(0, BM, layout=gl.SliceLayout(1, ca)) + m0
         kq = gl.arange(0, 16, layout=gl.SliceLayout(0, ca))
         qcm = gl.load(
             QC + hq * sqc_h + mq[:, None] * sqc_t + kq[None, :], mask=(kq < 2)[None, :], other=0.0)
+    elif CORR != 0 and CORR_MFMA == 2:
+        qc0 = gl.load(
+            QC.to(gl.pointer_type(gl.int32)) + (hq * sqc_h + mc * sqc_t) // 2)  # (a'0, a'1) fp16
     elif CORR != 0:
         qc0 = gl.load(QC + hq * sqc_h + mc * sqc_t).to(gl.float32)
         qc1 = gl.load(QC + hq * sqc_h + mc * sqc_t + 1).to(gl.float32)
@@ -141,7 +152,16 @@ def gl_qk(
         n0 = nbase + j * BN
         acc = gl.amd.cdna4.mfma_scaled(
             q, qs, "e2m1", k, ks, "e2m1", gl.zeros([BM, BN], gl.float32, layout=mfl))
-        if CORR != 0 and CORR_MFMA:
+        if CORR != 0 and CORR_MFMA == 2:
+            qa, _ = gl.broadcast(qc0[:, None], acc)
+            kb2, _ = gl.broadcast(kc0[None, :], acc)
+            acc = gl.inline_asm_elementwise(
+                "v_dot2_f32_f16 $0, $1, $2, $3",
+                "=v,v,v,v", [qa, kb2, acc],
+                dtype=gl.float32,
+                is_pure=True,
+                pack=1)
+        elif CORR != 0 and CORR_MFMA == 1:
             acc = gl.convert_layout(gl.amd.cdna3.mfma(qcm, kc0, gl.convert_layout(acc, mfl16)), mfl)
         elif CORR != 0:
             ab = qc0[:, None] * kc0[None, :] + qc1[:, None] * kc1[None, :]
@@ -174,6 +194,8 @@ def qk(
     qp, qs, qc, kp, ks, kc, out, gpg, head_dim, corr, corr_mfma=False, cfg=(128, 128, 4, 2, 2, 1)):
     """qp [T, n_q, D/2] u8, qs [T, n_q, D/32] u8, qc [T, n_q, 2] fp16 (and kp/ks/kc with n_kv); out [n_q, T, T]
     fp32. Strided views are fine (head = stride(1), token = stride(0)). cfg = (BM, BN, warps, WM, WN, NL).
+    corr_mfma: 0 / False = 2 FMAs, 1 / True = MFMA, 2 = v_dot2 (the coefficients must be fp16 pairs at an
+    even element offset, as P1 writes them).
     Returns the compiled kernel."""
     T, n_q = qp.shape[0], qp.shape[1]
     bm, bn, warps, wm, wn, nl = cfg
@@ -215,5 +237,5 @@ def qk(
         WN=wn,
         NL=nl,
         CORR=corr,
-        CORR_MFMA=bool(corr_mfma),
+        CORR_MFMA=int(corr_mfma),
         num_warps=warps)
