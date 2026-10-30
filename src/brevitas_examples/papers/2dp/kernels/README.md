@@ -174,9 +174,27 @@ to both methods; the comparison is always fastest Hadamard against fastest 2DP.
 | K through LDS, prefetched (`lds3`) | 1027 | 1073 | +4.8 % | 92012 |
 | **K through LDS with direct-to-LDS loads, tutorial schedule (`L`)** | **959** | **1005** | **+4.7 %** | 92078 |
 
-End to end (front end + FA kernel), the 2DP front end is 58 µs cheaper (388 vs 446 µs at T = 8192): 2DP is
-level with Hadamard at T = 8192 (+0.6 % [−0.0, +0.9] measured with `lds3`; about −0.9 % estimated with `L`),
-and faster at T ≤ 4096 (−3.5 % at 4096, −5.6 % at 2048 with the job 91982 variant).
+Final run (job 92099), 8B, both K through LDS, then each method on its fastest scheduling knobs (Hadamard:
+lazy rescale + no machine sink + scalarized packed ops; 2DP: lazy rescale + `s_setprio`). Median of 5
+interleaved repeats, [min, max] of the per-repeat ratio:
+
+| T | FA kernel Had / 2DP (µs) | FA 2DP vs Had | end to end Had / 2DP (µs) | end to end 2DP vs Had |
+|---|---|---|---|---|
+| 4096 | 226.2 / 235.6 | +4.2 % [+3.9, +4.5] | 478.1 / 455.8 | **−4.6 %** [−4.7, −4.3] |
+| 8192 | 903.0 / 949.9 | +4.9 % [+4.0, +6.1] | 1359.3 / 1343.0 | **−0.9 %** [−2.5, −0.7] |
+| 16384 | 3621.4 / 3776.4 | +4.2 % [+3.1, +4.9] | 4491.5 / 4527.3 | +0.9 % [+0.3, +1.3] |
+
+The first port in the same job: FA +11.6 / +12.3 / +15.4 %, end to end +0.5 / +6.9 / +12.5 %.
+The best Hadamard kernel runs at 1218 TF/s: 61 % of its static issue floor (551 µs) and 41 % MFMA utilization
+at the 1.78 GHz clock sampled under load.
+
+Caveats (from two independent reviews of the data):
+- The remaining +4–5 % is not established as the cost of the rank-2 term. With identical knobs for both
+  methods the FA gap ranges from −1.8 % to +5.6 %, and code placement alone moves the timing by 5–7 % (two
+  Hadamard builds whose loops differ only in where one load sits differ by 7 %).
+- On the benchmark inputs the lazy rescale is never needed, so its gain is best case; with the rescale needed
+  in 52 % of steps it was checked for correctness only.
+- O is checked against torch at T = 2048 only.
 
 Where the overhead came from (switch-off ablations, wrong outputs, diagnostic only; T = 8192):
 
@@ -187,7 +205,7 @@ Where the overhead came from (switch-off ablations, wrong outputs, diagnostic on
   scale loads and, for 2DP, the coefficient loads. Removing the in-loop K loads takes Hadamard from 1256 to
   797 µs and leaves 2DP only +2.7 % slower. Staging K once per workgroup in LDS (`L`) fixes this for both
   methods (Hadamard −24 %).
-- **What remains** with `L` is ~45 µs (+4.7 %), spread over the loop: with K loads removed +3.2 %, with exp
+- **What remains** with `L` (job 92078, same knobs for both) is ~45 µs (+4.7 %), spread over the loop: with K loads removed +3.2 %, with exp
   and rescale removed +3.9 %, with K and V loads removed +2.2 %.
 
 ### Toolchain: scheduler plugin and `fmha_v4`
