@@ -124,6 +124,66 @@ in one job, with the [min, max] of the per-repeat ratio (jobs 91172 / 91173):
   was measured before `v_dot2` was added, over MFMA and FMA only.
 
 
+### Over T: best MFMA, best FMA and best `v_dot2` against Hadamard
+
+`bench_rank2_variants.py --endpoint {logits,fa}`: for each T, every variant and Hadamard get their own best
+end-to-end tile; then the best chain of each in 5 interleaved repeats. The cells give 2DP vs Hadamard, end to
+end (front end + P2), median and [min, max] of the per-repeat ratio; the fastest 2DP variant is in bold.
+MI350X, one job per table.
+
+**Logit store** (`p2_qk.qk`, T ≤ 8192). Logits rel L2 vs the torch target: 1.12e-2 (1B), 1.17e-2 (8B), the
+same for the three variants.
+
+Llama-3.2-1B (job 92106):
+
+| T | Hadamard (µs) | MFMA | FMA | `v_dot2` |
+|---|---|---|---|---|
+| 1024 | 88.4 | −2.1 % [−2.2, −1.9] | **−2.4 %** [−2.4, −2.3] | −2.3 % [−2.3, −2.2] |
+| 2048 | 173.7 | **−2.5 %** [−2.9, −2.3] | −1.9 % [−2.1, −1.7] | −2.5 % [−2.7, −2.0] |
+| 4096 | 499.5 | **−0.4 %** [−0.6, −0.3] | +0.8 % [+0.6, +0.9] | +1.4 % [+1.3, +1.6] |
+| 8192 | 1953.6 | **−2.5 %** [−2.6, −2.5] | −1.4 % [−1.5, −1.3] | −1.5 % [−1.6, −1.5] |
+
+Llama-3.1-8B (job 92108):
+
+| T | Hadamard (µs) | MFMA | FMA | `v_dot2` |
+|---|---|---|---|---|
+| 1024 | 134.9 | −3.8 % [−3.9, −3.7] | **−3.9 %** [−4.1, −3.9] | −3.7 % [−3.8, −3.6] |
+| 2048 | 232.6 | **−2.0 %** [−2.1, −1.9] | +0.3 % [+0.1, +0.4] | −0.7 % [−0.7, −0.6] |
+| 4096 | 671.2 | **−2.1 %** [−2.4, −2.0] | +0.2 % [+0.0, +0.3] | −0.3 % [−0.5, −0.1] |
+| 8192 | 2186.2 | **−0.4 %** [−0.4, −0.3] | +1.3 % [+1.2, +1.6] | +0.1 % [−0.0, +0.1] |
+
+**QK^T + online softmax** (`p2_fa_stats.qk_stats`, see [Flash-attention endpoint](#flash-attention-endpoint)).
+`m` / `l` vs torch: max abs 1e-6 / max rel 7e-7 for every variant.
+
+Llama-3.2-1B (job 92107):
+
+| T | Hadamard (µs) | MFMA | FMA | `v_dot2` |
+|---|---|---|---|---|
+| 1024 | 71.4 | +7.7 % [+7.2, +7.8] | +8.5 % [+8.4, +8.9] | **−0.8 %** [−1.1, −0.7] |
+| 2048 | 106.5 | +20.5 % [+20.4, +20.6] | +26.0 % [+26.0, +26.1] | **+2.4 %** [+2.3, +2.4] |
+| 4096 | 245.8 | +37.0 % [+36.7, +37.3] | +50.5 % [+50.3, +51.0] | **+9.2 %** [+9.0, +9.5] |
+| 8192 | 850.7 | +45.8 % [+45.6, +46.2] | +62.2 % [+61.3, +64.0] | **+15.8 %** [+15.0, +16.2] |
+| 16384 | 2958.2 | +55.1 % [+48.7, +56.7] | +74.1 % [+66.6, +75.7] | **+20.8 %** [+16.7, +21.4] |
+
+Llama-3.1-8B (job 92109):
+
+| T | Hadamard (µs) | MFMA | FMA | `v_dot2` |
+|---|---|---|---|---|
+| 1024 | 121.6 | −1.3 % [−2.0, −1.2] | −2.7 % [−2.8, −2.3] | **−6.4 %** [−6.5, −6.2] |
+| 2048 | 176.0 | +8.5 % [+8.3, +9.0] | +8.6 % [+8.0, +8.6] | **−3.2 %** [−3.5, −1.6] |
+| 4096 | 453.5 | +17.2 % [+14.8, +17.8] | +18.0 % [+17.8, +18.4] | **−0.6 %** [−1.6, +0.5] |
+| 8192 | 1332.9 | +31.5 % [+29.7, +32.6] | +34.8 % [+33.2, +35.1] | **+6.1 %** [+5.5, +6.5] |
+| 16384 | 4734.7 | +32.4 % [+25.7, +33.3] | +36.2 % [+27.7, +37.5] | **+5.1 %** [+4.9, +5.5] |
+
+- **Logit store:** MFMA is the best variant from T = 2048 on, and 2DP beats Hadamard at every T for both
+  models. The three variants are within ~2 % of each other: the store bounds the kernel.
+- **Softmax endpoint:** `v_dot2` is the best variant at every T; MFMA and FMA are 8–74 % slower than Hadamard except at 8B T = 1024. In this kernel the
+  compiler schedules the padded MFMA / the FMAs poorly next to the softmax, while one `v_dot2` per logit
+  stays cheap. 8B: 2DP wins up to T = 4096 and loses 5–6 % from 8192. 1B (head_dim 64: half the fp4 work per
+  logit, the same rank-2 work) loses from T = 2048.
+- The full flash-attention kernel below uses the MFMA form with a hand-placed schedule, and gets the rank-2
+  term to +4–5 % of the FA kernel.
+
 ## Flash-attention endpoint
 
 The results above end at the fp32 logit store, which bounds both pipelines at large T. Flash attention never
@@ -207,6 +267,17 @@ Where the overhead came from (switch-off ablations, wrong outputs, diagnostic on
   methods (Hadamard −24 %).
 - **What remains** with `L` (job 92078, same knobs for both) is ~45 µs (+4.7 %), spread over the loop: with K loads removed +3.2 %, with exp
   and rescale removed +3.9 %, with K and V loads removed +2.2 %.
+
+K-tile LDS reads (`L`, checked lane by lane against a measured gfx950 LDS bank model, job 92155):
+- **K codes:** each wave reads the whole 4 KB tile with 4 `ds_read_b128`, 1 KB contiguous per instruction:
+  conflict-free. Each K tile is written to LDS once per workgroup by direct-to-LDS loads.
+- **Scales:** 4 `ds_read_u8`, conflict-free. Reordering the four scale blocks (same order for Q, K codes and
+  scales; QK^T unchanged) gives 2 `ds_read_u16`: −0.5 % (Had) / −0.6 % (2DP) at T = 16384, within the
+  2–4 µs noise at T = 8192 (job 92168).
+- **2DP coefficients:** the only conflict, 2-way on a half-rate `ds_read2st64_b64` (4× the cost of one
+  `ds_read_b128`). A lane-major layout read with one `ds_read_b128` removes it but does not speed the kernel up.
+- **Global memory:** relaxing the in-loop `vmcnt` waits changes nothing, so the loop does not wait on global
+  memory in steady state. Predicating off the loads of the waves whose LDS write is discarded costs ~45 µs.
 
 ### Toolchain: scheduler plugin and `fmha_v4`
 
