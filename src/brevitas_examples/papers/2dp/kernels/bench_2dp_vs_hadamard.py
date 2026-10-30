@@ -10,7 +10,7 @@
             P2 = p2_qk.qk(corr=0): bare fp4 QK^T
 Endpoint: fp32 logits [n_q, T, T] of all Q heads, no 1/sqrt(D) (owned by flash attention). The 2DP output
 is (1-g) S: 1/(1-g) joins the softmax scale. For each pipeline the QK^T variant and tile are picked on the
-end-to-end chain (same 8 candidates); the two pipelines are then timed in --repeats interleaved repeats, median.
+end-to-end chain (same candidates: every (BM, BN, warps, WM, WN, NL) of p2_qk.tiles); the two pipelines are then timed in --repeats interleaved repeats, median.
 
     python bench_2dp_vs_hadamard.py --model 8b --ts 1024 2048 4096 8192 \
         --u-path U_selfgen_8b_2dp_allrand_s0.pt --u-layer 15 --out bench_8b.json
@@ -38,8 +38,8 @@ from layout_2dp import permute_fused_qkv_split_rope_hd
 from layout_2dp import rope_tables_hd
 from layout_2dp import ublk_constants
 from p1_2dp import front_end_2dp
-from p2_qk import CANDS
 from p2_qk import qk
+from p2_qk import tiles
 from reference import mx_quant
 from reference import ref_2dp
 from reference import ref_logits
@@ -184,6 +184,7 @@ def main():
     args = ap.parse_args()
     dev = "cuda"
     cfg = MODELS[args.model]
+    D = cfg["hd"]
     U = load_u(cfg, args.u_path, args.u_layer, dev)
     result = dict(model=cfg, gamma=args.gamma, device=torch.cuda.get_device_name(0), runs={})
     print(
@@ -211,7 +212,7 @@ def main():
         for f, ks in (("twodp", ("qk_2dp_mfma", "qk_2dp_valu")), ("hadamard", ("qk_had",))):
             cands = []
             for k in ks:
-                for c in CANDS:
+                for c in [c for c in tiles(D) if T % (c[1] * c[5]) == 0 and T % c[0] == 0]:
                     try:
                         cands.append((med_us(chain(f, k, c)), k, c))
                     except Exception as e:  # noqa: BLE001
@@ -236,11 +237,11 @@ def main():
             twodp_vs_had_pct=dict(median=statistics.median(ratio), min=min(ratio), max=max(ratio)),
             qk=dict(twodp=list(tune["twodp"]), hadamard=list(tune["hadamard"])))
         if i == 0:
-            tiles = dict(
+            best_tiles = dict(
                 qk_2dp_mfma=tune["twodp"][1],
                 qk_2dp_valu=tune["twodp"][1],
                 qk_had=tune["hadamard"][1])
-            r["check"] = check(cfg, s, p1, p2, tiles, U, args.gamma)
+            r["check"] = check(cfg, s, p1, p2, best_tiles, U, args.gamma)
             print("check:", {k: f"{v:.3e}" for k, v in r["check"].items()})
             print(hdr)
         q = r["qk_in_chain"]

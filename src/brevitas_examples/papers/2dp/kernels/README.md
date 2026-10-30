@@ -7,7 +7,7 @@ folded unshrink against the standard Hadamard pipeline.
 | file | content |
 |---|---|
 | `p1_2dp.py` | P1 (Gluon): 8-wave ping-pong projection GEMM with the 2DP epilogue: RoPE, plane coordinates `a' = (1-gamma) a`, MXFP4 of the residual. `epi=0` is a plain fp16 store, used as the Hadamard projection |
-| `p2_qk.py` | P2 (Gluon): fp4 QK^T (`mfma_scaled`), plus the 2DP rank-2 term `a'.b` on the matrix core or the VALU (`corr=1`); `corr=0` is the bare QK^T |
+| `p2_qk.py` | P2 (Gluon): fp4 QK^T (`mfma_scaled`), plus the 2DP rank-2 term `a'.b` (`corr=1`); `corr=0` is the bare QK^T. One program computes `NL` consecutive logit tiles: the Q side is loaded once, and the next tile's K side is loaded before the current tile is stored |
 | `had_j2.py` | Hadamard quantizer (Triton): RoPE + `H_D / sqrt(D)` + MXFP4 |
 | `layout_2dp.py` | offline: weight column permutation, RoPE tables, per-tile plane tables |
 | `reference.py` | torch fp32 references for the correctness check |
@@ -52,8 +52,8 @@ Timing uses `triton.testing.do_bench` (warmup 25 ms, timing budget 100 ms). It f
 and returns the median, so the number of timed runs depends on the kernel's duration: about 45 at 2 ms,
 several hundred at 0.1 ms.
 
-- **Tile selection.** For each pipeline, the QK^T variant and tile are picked on the end-to-end chain
-  (projection → QK^T), from the same 8 candidates. A QK^T kernel timed alone after the L2 flush does not
+- **Tile selection.** For each pipeline, the QK^T variant and tile `(BM, BN, warps, WM, WN, NL)` are picked on
+  the end-to-end chain (projection → QK^T), from the same candidates (`p2_qk.tiles`, about 100 tilings). A QK^T kernel timed alone after the L2 flush does not
   rank the tiles as they run behind the front end. Picking tiles alone flipped the 8B T = 8192 result
   between jobs.
 - **Repeats.** The two pipelines and their front ends are then timed in `--repeats` interleaved repeats
@@ -61,23 +61,25 @@ several hundred at 0.1 ms.
 
 ## Results
 
-MI350X, end to end, in µs, median of 5 interleaved repeats. The last column gives each 2DP vs Hadamard
-ratio with the [min, max] of the per-repeat ratio.
+MI350X, end to end, in µs. Each value is the median over 3 separate jobs; each job is itself the median of 5
+interleaved repeats. The last column lists the 2DP vs Hadamard ratio of each of the 3 jobs.
 
-| model | T | 2DP | Hadamard | 2DP vs Hadamard |
+| model | T | 2DP | Hadamard | 2DP vs Hadamard (3 jobs) |
 |---|---|---|---|---|
-| Llama-3.2-1B | 1024 | 87.6 | 87.6 | 0.0 % [−0.1, +0.1] |
-| Llama-3.2-1B | 2048 | **168.7** | 173.9 | −3.0 % [−3.4, −2.9] |
-| Llama-3.2-1B | 4096 | **515.9** | 523.6 | −1.5 % [−1.6, −1.3] |
-| Llama-3.2-1B | 8192 | **1900.3** | 1935.3 | −1.8 % [−1.9, −1.8] |
-| Llama-3.1-8B | 1024 | **130.6** | 133.6 | −2.2 % [−2.4, −2.1] |
-| Llama-3.1-8B | 2048 | **228.3** | 234.6 | −2.6 % [−2.7, −2.6] |
-| Llama-3.1-8B | 4096 | **654.6** | 672.2 | −2.6 % [−2.8, −2.6] |
-| Llama-3.1-8B | 8192 | 2223.4 | **2169.6** | +2.4 % [+2.2, +2.6] |
+| Llama-3.2-1B | 1024 | **85.8** | 88.0 | −2.6 / −2.2 / −2.6 % |
+| Llama-3.2-1B | 2048 | **168.6** | 172.2 | −2.2 / −2.0 / −2.1 % |
+| Llama-3.2-1B | 4096 | **497.2** | 500.9 | −0.9 / −0.8 / −0.5 % |
+| Llama-3.2-1B | 8192 | 1912.3 | 1909.8 | −0.1 / +0.2 / +0.2 % |
+| Llama-3.1-8B | 1024 | **129.2** | 134.0 | −3.8 / −3.8 / −3.2 % |
+| Llama-3.1-8B | 2048 | **225.7** | 232.8 | −3.2 / −3.3 / −3.1 % |
+| Llama-3.1-8B | 4096 | **657.6** | 673.1 | −2.3 / −2.5 / −2.5 % |
+| Llama-3.1-8B | 8192 | **2177.1** | 2187.9 | −0.9 / −0.6 / −0.4 % |
 
 - **Front end.** The 2DP P1 is 3–25 % faster than Hadamard's J1 + J2, because RoPE, the plane and MXFP4 all
   run in the GEMM epilogue.
-- **QK^T.** Measured inside the chain, the rank-2 term costs about 0 % at 1B. At 8B it costs up to 6 %
-  (1841 vs 1730 µs at T = 8192). That cost grows with T², while the front-end saving grows with T. At
-  8B T = 8192 the QK^T cost wins.
-- **Large T.** Both pipelines are bound by the fp32 logit store.
+- **QK^T.** The rank-2 term costs 0–8 % over Hadamard's QK^T, measured inside the chain. This cost grows
+  with T², while the front-end saving grows with T. At T = 8192, the two roughly cancel.
+- **Large T.** Both pipelines are bound by the fp32 logit store. At T = 8192 the result moves by about
+  ±1 % between jobs, so 1B is a tie there and 8B a small win.
+- **The `NL` loop** brought 8B T = 8192 from +2.4 % (one tile per program) to −0.4 … −0.9 %; the best 2DP
+  tile there is (256, 64, 4, 4, 1, NL = 2).

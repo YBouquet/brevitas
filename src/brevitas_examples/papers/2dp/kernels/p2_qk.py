@@ -3,8 +3,10 @@
 
 """P2: fp4 QK^T logits (+ the 2DP rank-2 term), one Gluon kernel, any head_dim (64 / 128).
 
-One program = a (BM x BN) logit tile of one Q head; GQA: Q head hq contracts with K head hq // GPG.
-The whole head (D/2 packed bytes, D/32 E8M0 scales) is one `mfma_scaled` (e2m1 x e2m1) into an explicit
+One program = NL consecutive (BM x BN) logit tiles of one Q head; GQA: Q head hq contracts with K head
+hq // GPG. The Q side (fp4 codes, E8M0 scales, a') is loaded once and reused for the NL tiles; the K side of
+tile j+1 is loaded before the logits of tile j are stored, so its latency overlaps the store. Per tile, the
+whole head (D/2 packed bytes, D/32 E8M0 scales) is one `mfma_scaled` (e2m1 x e2m1) into an explicit
 AMDMFMALayout accumulator: no K loop. Operands are fp4 packed bytes with k_width = 16.
 CORR (constexpr): 0 = bare fp4 QK^T (Hadamard baseline); 1 = 2DP: R + a'.b with a' = (1-gamma) a stored
 by P1 (folded unshrink: the output is (1-gamma) S, and 1/(1-gamma) joins the softmax scale).
@@ -16,6 +18,51 @@ Output: fp32 logits [n_q, T, T].
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+
+@gluon.jit
+def _k_side(
+        KP,
+        KS,
+        KC,
+        hk,
+        n0,
+        skp_h,
+        skp_t,
+        sks_h,
+        sks_t,
+        skc_h,
+        skc_t,
+        KB: gl.constexpr,
+        NS: gl.constexpr,
+        BN: gl.constexpr,
+        b_lay: gl.constexpr,
+        blk_s: gl.constexpr,
+        sc_b: gl.constexpr,
+        cb: gl.constexpr,
+        mfl: gl.constexpr,
+        CORR: gl.constexpr,
+        CORR_MFMA: gl.constexpr):
+    kb_ = gl.arange(0, KB, layout=gl.SliceLayout(1, b_lay))
+    nb = gl.arange(0, BN, layout=gl.SliceLayout(0, b_lay)) + n0
+    k = gl.load(KP + hk * skp_h + nb[None, :] * skp_t + kb_[:, None])
+    msb = gl.arange(0, BN, layout=gl.SliceLayout(1, blk_s)) + n0
+    nsa = gl.arange(0, NS, layout=gl.SliceLayout(0, blk_s))
+    ks = gl.convert_layout(gl.load(KS + hk * sks_h + msb[:, None] * sks_t + nsa[None, :]), sc_b)
+    if CORR != 0 and CORR_MFMA:
+        kk = gl.arange(0, 16, layout=gl.SliceLayout(1, cb))
+        nk = gl.arange(0, BN, layout=gl.SliceLayout(0, cb)) + n0
+        kc0 = gl.load(
+            KC + hk * skc_h + nk[None, :] * skc_t + kk[:, None], mask=(kk < 2)[:, None], other=0.0)
+        kc1 = kc0
+    elif CORR != 0:
+        nc = gl.arange(0, BN, layout=gl.SliceLayout(0, mfl)) + n0
+        kc0 = gl.load(KC + hk * skc_h + nc * skc_t).to(gl.float32)
+        kc1 = gl.load(KC + hk * skc_h + nc * skc_t + 1).to(gl.float32)
+    else:
+        kc0 = ks
+        kc1 = ks
+    return k, ks, kc0, kc1
 
 
 @gluon.jit
@@ -48,110 +95,95 @@ def gl_qk(
         BN: gl.constexpr,
         WM: gl.constexpr,
         WN: gl.constexpr,
-        FUSE_LOAD: gl.constexpr,
+        NL: gl.constexpr,
         CORR: gl.constexpr,
         CORR_MFMA: gl.constexpr):
-    KB: gl.constexpr = HD // 2  # packed bytes per head
-    NS: gl.constexpr = HD // 32  # e8m0 scales per head
+    KB: gl.constexpr = HD // 2
+    NS: gl.constexpr = HD // 32
     pid_m = gl.program_id(0)
     pid_n = gl.program_id(1)
     hq = gl.program_id(2)
     hk = hq // GPG
     m0 = pid_m * BM
-    n0 = pid_n * BN
+    nbase = pid_n * (BN * NL)
     mfl: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[32, 32, 64], transposed=False, warps_per_cta=[WM, WN])
-    # fp4 operands are packed bytes: k_width = 16 bytes = the 32 e2m1 each lane feeds one
-    # scaled MFMA (gluon test_amd_mfma_scaled). k_width=32, inherited from gluon_e2e.py, is wrong.
     a_lay: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfl, k_width=16)
     b_lay: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfl, k_width=16)
     blk_s: gl.constexpr = gl.BlockedLayout([1, NS], [64, 1], [WM, WN], [1, 0])
-
-    if FUSE_LOAD:
-        ma = gl.arange(0, BM, layout=gl.SliceLayout(1, a_lay)) + m0
-        ka = gl.arange(0, KB, layout=gl.SliceLayout(0, a_lay))
-        q = gl.load(QP + hq * sqp_h + ma[:, None] * sqp_t + ka[None, :])
-        kb_ = gl.arange(0, KB, layout=gl.SliceLayout(1, b_lay))
-        nb = gl.arange(0, BN, layout=gl.SliceLayout(0, b_lay)) + n0
-        k = gl.load(KP + hk * skp_h + nb[None, :] * skp_t + kb_[:, None])
-    else:
-        blk_a: gl.constexpr = gl.BlockedLayout([1, KB], [64, 1], [WM, WN], [1, 0])
-        blk_b: gl.constexpr = gl.BlockedLayout([KB, 1], [1, 64], [WN, WM], [0, 1])
-        ma = gl.arange(0, BM, layout=gl.SliceLayout(1, blk_a)) + m0
-        ka = gl.arange(0, KB, layout=gl.SliceLayout(0, blk_a))
-        q = gl.load(QP + hq * sqp_h + ma[:, None] * sqp_t + ka[None, :])
-        kb_ = gl.arange(0, KB, layout=gl.SliceLayout(1, blk_b))
-        nb = gl.arange(0, BN, layout=gl.SliceLayout(0, blk_b)) + n0
-        k = gl.load(KP + hk * skp_h + nb[None, :] * skp_t + kb_[:, None])
-        q = gl.convert_layout(q, a_lay)
-        k = gl.convert_layout(k, b_lay)
-
-    msa = gl.arange(0, BM, layout=gl.SliceLayout(1, blk_s)) + m0
-    nsa = gl.arange(0, NS, layout=gl.SliceLayout(0, blk_s))
-    qs = gl.load(QS + hq * sqs_h + msa[:, None] * sqs_t + nsa[None, :])
-    msb = gl.arange(0, BN, layout=gl.SliceLayout(1, blk_s)) + n0
-    ks = gl.load(KS + hk * sks_h + msb[:, None] * sks_t + nsa[None, :])
     sc_a: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(a_lay, [BM, NS])
     sc_b: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(b_lay, [BN, NS])
-    qs = gl.convert_layout(qs, sc_a)
-    ks = gl.convert_layout(ks, sc_b)
+    mfl16: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[32, 32, 16], transposed=False, warps_per_cta=[WM, WN])
+    ca: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfl16, k_width=8)
+    cb: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfl16, k_width=8)
 
+    # Q side: once per program
+    ma = gl.arange(0, BM, layout=gl.SliceLayout(1, a_lay)) + m0
+    ka = gl.arange(0, KB, layout=gl.SliceLayout(0, a_lay))
+    q = gl.load(QP + hq * sqp_h + ma[:, None] * sqp_t + ka[None, :])
+    msa = gl.arange(0, BM, layout=gl.SliceLayout(1, blk_s)) + m0
+    nsa = gl.arange(0, NS, layout=gl.SliceLayout(0, blk_s))
+    qs = gl.convert_layout(gl.load(QS + hq * sqs_h + msa[:, None] * sqs_t + nsa[None, :]), sc_a)
     mc = gl.arange(0, BM, layout=gl.SliceLayout(1, mfl)) + m0
-    nc = gl.arange(0, BN, layout=gl.SliceLayout(0, mfl)) + n0
-    # plane-coordinate loads are issued BEFORE the fp4 MFMA, with the q/k loads, so their
-    # latency overlaps instead of sitting between the MFMA and the store of every program
     if CORR != 0 and CORR_MFMA:
-        # rank-2 term on the MATRIX CORE: [qc0 qc1 0..0] (K padded 2 -> 16) @ [kc0; kc1; 0..] as one
-        # fp16 32x32x16 MFMA accumulating into the same tile. A 32x32 accumulator has the same
-        # register mapping whatever the instruction K, so the two MFMA layouts convert trivially.
-        mfl16: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4, instr_shape=[32, 32, 16], transposed=False, warps_per_cta=[WM, WN])
-        ca: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfl16, k_width=8)
-        cb: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfl16, k_width=8)
         mq = gl.arange(0, BM, layout=gl.SliceLayout(1, ca)) + m0
         kq = gl.arange(0, 16, layout=gl.SliceLayout(0, ca))
         qcm = gl.load(
             QC + hq * sqc_h + mq[:, None] * sqc_t + kq[None, :], mask=(kq < 2)[None, :], other=0.0)
-        kk = gl.arange(0, 16, layout=gl.SliceLayout(1, cb))
-        nk = gl.arange(0, BN, layout=gl.SliceLayout(0, cb)) + n0
-        kcm = gl.load(
-            KC + hk * skc_h + nk[None, :] * skc_t + kk[:, None], mask=(kk < 2)[:, None], other=0.0)
     elif CORR != 0:
-        # plane coordinates straight into the accumulator's row / column slices
         qc0 = gl.load(QC + hq * sqc_h + mc * sqc_t).to(gl.float32)
         qc1 = gl.load(QC + hq * sqc_h + mc * sqc_t + 1).to(gl.float32)
-        kc0 = gl.load(KC + hk * skc_h + nc * skc_t).to(gl.float32)
-        kc1 = gl.load(KC + hk * skc_h + nc * skc_t + 1).to(gl.float32)
 
-    acc = gl.zeros([BM, BN], gl.float32, layout=mfl)
-    acc = gl.amd.cdna4.mfma_scaled(q, qs, "e2m1", k, ks, "e2m1", acc)
+    k, ks, kc0, kc1 = _k_side(KP, KS, KC, hk, nbase, skp_h, skp_t, sks_h, sks_t, skc_h, skc_t,
+                              KB, NS, BN, b_lay, blk_s, sc_b, cb, mfl, CORR, CORR_MFMA)
+    for j in gl.static_range(NL):
+        n0 = nbase + j * BN
+        acc = gl.amd.cdna4.mfma_scaled(
+            q, qs, "e2m1", k, ks, "e2m1", gl.zeros([BM, BN], gl.float32, layout=mfl))
+        if CORR != 0 and CORR_MFMA:
+            acc = gl.convert_layout(gl.amd.cdna3.mfma(qcm, kc0, gl.convert_layout(acc, mfl16)), mfl)
+        elif CORR != 0:
+            ab = qc0[:, None] * kc0[None, :] + qc1[:, None] * kc1[None, :]
+            acc = acc + ab
+        if j + 1 < NL:  # next tile's K side before this tile's store
+            k, ks, kc0, kc1 = _k_side(KP, KS, KC, hk, n0 + BN, skp_h, skp_t, sks_h, sks_t, skc_h, skc_t,
+                                      KB, NS, BN, b_lay, blk_s, sc_b, cb, mfl, CORR, CORR_MFMA)
+        nc = gl.arange(0, BN, layout=gl.SliceLayout(0, mfl)) + n0
+        gl.store(OUT + hq * so_h + mc[:, None] * so_m + nc[None, :] * so_n, acc)
 
-    if CORR != 0 and CORR_MFMA:
-        acc = gl.convert_layout(gl.amd.cdna3.mfma(qcm, kcm, gl.convert_layout(acc, mfl16)), mfl)
-    elif CORR != 0:
-        ab = qc0[:, None] * kc0[None, :] + qc1[:, None] * kc1[None, :]
-        acc = acc + ab
-    gl.store(OUT + hq * so_h + mc[:, None] * so_m + nc[None, :] * so_n, acc)
+
+def tiles(head_dim, max_acc=128):
+    """(BM, BN, warps, WM, WN, NL): every 32x32-MFMA tiling with <= max_acc accumulator regs per thread."""
+    out = []
+    for bm in (64, 128, 256):
+        for bn in (64, 128, 256):
+            for w in (4, 8):
+                if bm * bn // (64 * w) > max_acc:
+                    continue
+                for wm in (1, 2, 4, 8):
+                    wn = w // wm
+                    if wm * wn != w or bm // wm < 32 or bn // wn < 32:
+                        continue
+                    for nl in (1, 2, 4):
+                        out.append((bm, bn, w, wm, wn, nl))
+    return out
 
 
-# (BM, BN, warps, WM, WN, fuse); all valid tilings, picked per (T, D, CORR) by `tune_qk`
-CANDS = [(128, 128, 4, 2, 2, True), (128, 64, 4, 4, 1, False), (64, 128, 4, 2, 2, False),
-         (256, 64, 8, 8, 1, True), (128, 64, 4, 2, 2, True), (64, 128, 4, 1, 4, True),
-         (256, 128, 4, 4, 1, True), (128, 128, 4, 4, 1, True)]
-
-
-def qk(qp, qs, qc, kp, ks, kc, out, gpg, head_dim, corr, corr_mfma=False, cfg=CANDS[0]):
-    """qp [T, n_q, D/2] u8, qs [T, n_q, D/32] u8, qc [T, n_q, 2] fp16 (and kp/ks/kc with n_kv);
-    out [n_q, T, T] fp32. Strided views are fine (head = stride(1), token = stride(0)).
-    Returns the compiled kernel (asm / n_regs for the ISA table)."""
+def qk(
+    qp, qs, qc, kp, ks, kc, out, gpg, head_dim, corr, corr_mfma=False, cfg=(128, 128, 4, 2, 2, 1)):
+    """qp [T, n_q, D/2] u8, qs [T, n_q, D/32] u8, qc [T, n_q, 2] fp16 (and kp/ks/kc with n_kv); out [n_q, T, T]
+    fp32. Strided views are fine (head = stride(1), token = stride(0)). cfg = (BM, BN, warps, WM, WN, NL).
+    Returns the compiled kernel."""
     T, n_q = qp.shape[0], qp.shape[1]
-    bm, bn, warps, wm, wn, fuse = cfg
+    bm, bn, warps, wm, wn, nl = cfg
     if qc is None:
-        qc, kc = qs, ks  # unused when corr == 0
+        qc, kc = qs, ks
         sqc, skc = (0, 0), (0, 0)
     else:
         sqc, skc = (qc.stride(1), qc.stride(0)), (kc.stride(1), kc.stride(0))
-    grid = (triton.cdiv(T, bm), triton.cdiv(T, bn), n_q)
+    assert T % (bn * nl) == 0 and T % bm == 0
+    grid = (T // bm, T // (bn * nl), n_q)
     return gl_qk[grid](
         qp,
         qs,
@@ -181,23 +213,7 @@ def qk(qp, qs, qc, kp, ks, kc, out, gpg, head_dim, corr, corr_mfma=False, cfg=CA
         BN=bn,
         WM=wm,
         WN=wn,
-        FUSE_LOAD=fuse,
+        NL=nl,
         CORR=corr,
         CORR_MFMA=bool(corr_mfma),
         num_warps=warps)
-
-
-def tune_qk(bench_fn, args, kwargs, cands=CANDS):
-    """Autotune-lite: time every candidate, return (best_cfg, best_us). `bench_fn(callable)`
-    returns microseconds. Candidates that fail to compile are skipped."""
-    best = (None, float("inf"))
-    for cfg in cands:
-        try:
-            t = bench_fn(lambda: qk(*args, cfg=cfg, **kwargs))
-        except Exception as e:  # noqa: BLE001
-            print(
-                f"    [qk cand {cfg} skipped: {type(e).__name__}: {str(e).splitlines()[0][:120]}]")
-            continue
-        if t < best[1]:
-            best = (cfg, t)
-    return best
