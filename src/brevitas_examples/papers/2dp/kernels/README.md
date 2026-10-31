@@ -1,20 +1,38 @@
-# 2DP vs Hadamard: MXFP4 QK^T kernels on gfx950
+# 2DP vs Hadamard: MXFP4 attention kernels on gfx950
 
-These kernels and the benchmark time the full MXFP4 score path on an AMD MI350X/MI355X (gfx950):
-QKV projection → RoPE → transform → MXFP4 → QK^T logits. They compare 2DP with the frozen plane and the
+These kernels and benchmarks time the MXFP4 attention path on an AMD MI350X/MI355X (gfx950):
+QKV projection → RoPE → transform → MXFP4 → attention. They compare 2DP with the frozen plane and the
 folded unshrink against the standard Hadamard pipeline.
+
+## Kernels: which one to read
+
+Three attention kernels were measured. Only the full flash-attention kernel is the real operator a model runs;
+the other two are **partial kernels**, kept because they isolate one part of the cost.
+
+| kernel | computes | writes | status |
+|---|---|---|---|
+| **Full flash attention** ([section](#full-flash-attention-the-real-kernel)) | QK^T → online softmax → P.V → O / l | O fp16 [T, n_q, D] + LSE | **the real kernel: the reference result** |
+| Partial kernel 1: logit store (`p2_qk.py`, [results](#results-partial-kernel-1-logit-store)) | QK^T only | the full T x T fp32 logits | partial: bound by the T² store, so the rank-2 term looks almost free |
+| Partial kernel 2: QK^T + online softmax (`p2_fa_stats.py`, [results](#partial-kernel-2-qkt--online-softmax-no-pv-no-output)) | QK^T + row max / row sum | m, l per row | partial: no P.V, so the rank-2 term's share of the work is overstated |
+
+Full flash attention, 2DP (rank-2 term on MFMA) vs Hadamard, fastest vs fastest, MI350X:
+
+| model | T | FA kernel 2DP vs Had | end to end 2DP vs Had | job |
+|---|---|---|---|---|
+| Llama-3.2-1B | 2048 / 4096 / 8192 / 16384 | +5.6 / +6.0 / +7.2 / +6.8 % | −1.8 / −2.9 / +0.9 / +4.2 % | 92366 |
+| Llama-3.1-8B | 4096 / 8192 / 16384 | +4.2 / +4.9 / +4.2 % | −4.6 / −0.9 / +0.9 % | 92099 |
 
 | file | content |
 |---|---|
 | `p1_2dp.py` | P1 (Gluon): 8-wave ping-pong projection GEMM with the 2DP epilogue: RoPE, plane coordinates `a' = (1-gamma) a`, MXFP4 of the residual. `epi=0` is a plain fp16 store, used as the Hadamard projection |
-| `p2_qk.py` | P2 (Gluon): fp4 QK^T (`mfma_scaled`), plus the 2DP rank-2 term `a'.b` (`corr=1`); `corr=0` is the bare QK^T. One program computes `NL` consecutive logit tiles: the Q side is loaded once, and the next tile's K side is loaded before the current tile is stored |
+| `p2_qk.py` | P2, **partial kernel 1** (Gluon): fp4 QK^T (`mfma_scaled`), plus the 2DP rank-2 term `a'.b` (`corr=1`); `corr=0` is the bare QK^T. One program computes `NL` consecutive logit tiles: the Q side is loaded once, and the next tile's K side is loaded before the current tile is stored |
 | `had_j2.py` | Hadamard quantizer (Triton): RoPE + `H_D / sqrt(D)` + MXFP4 |
 | `layout_2dp.py` | offline: weight column permutation, RoPE tables, per-tile plane tables |
 | `reference.py` | torch fp32 references for the correctness check |
-| `bench_2dp_vs_hadamard.py` | the benchmark |
+| `bench_2dp_vs_hadamard.py` | the benchmark (partial kernel 1) |
 | `bench_rank2_variants.py` | the three rank-2 variants against Hadamard at one (model, T): correctness, end-to-end tile sweep, interleaved repeats |
-| `p2_fa_stats.py` | P2, flash-attention endpoint (Gluon): fp4 QK^T (+ rank-2 term) consumed by an online softmax; only the row max `m` and row sum `l` are written, no logits |
-| `bench_fa_proxy.py` | the benchmark with `p2_fa_stats` as P2 (see [Flash-attention endpoint](#flash-attention-endpoint)) |
+| `p2_fa_stats.py` | P2, **partial kernel 2** (Gluon): fp4 QK^T (+ rank-2 term) consumed by an online softmax; only the row max `m` and row sum `l` are written, no logits |
+| `bench_fa_proxy.py` | the benchmark with `p2_fa_stats` as P2 (partial kernel 2) |
 
 ```
 2DP       P1: x @ W -> RoPE -> a = U^T x_LF, r = x - U a -> MXFP4(r), a' = (1-gamma) a     one kernel
@@ -62,7 +80,10 @@ several hundred at 0.1 ms.
 - **Repeats.** The two pipelines and their front ends are then timed in `--repeats` interleaved repeats
   (default 5). The table gives the median and the range of the per-repeat ratio.
 
-## Results
+## Results: partial kernel 1, logit store
+
+*Partial kernel: QK^T only, the T x T fp32 logits are written. Not the attention operator; see
+[Full flash attention](#full-flash-attention-the-real-kernel) for the real kernel.*
 
 MI350X, end to end, in µs. Each value is the median over 3 separate jobs; each job is itself the median of 5
 interleaved repeats. The last column lists the 2DP vs Hadamard ratio of each of the 3 jobs.
@@ -88,6 +109,10 @@ interleaved repeats. The last column lists the 2DP vs Hadamard ratio of each of 
   tile there is (256, 64, 4, 4, 1, NL = 2).
 
 ## The rank-2 term: MFMA, FMA or `v_dot2`
+
+The three variants compute the same rank-2 term on different units. `v_dot2` is THE vector-unit (VALU)
+approach; the 2-FMA variant is kept for reference only. The MFMA variant is kept for the MFMA vs `v_dot2`
+comparison. The measurements in this section are on the partial kernels.
 
 The fp4 product runs on the matrix core (`mfma_scaled`) in both pipelines. 2DP adds `a'.b`, a K = 2 product
 per logit. `p2_qk.qk(corr=1, corr_mfma=...)` computes it in one of three ways:
@@ -131,7 +156,7 @@ end-to-end tile; then the best chain of each in 5 interleaved repeats. The cells
 end (front end + P2), median and [min, max] of the per-repeat ratio; the fastest 2DP variant is in bold.
 MI350X, one job per table.
 
-**Logit store** (`p2_qk.qk`, T ≤ 8192). Logits rel L2 vs the torch target: 1.12e-2 (1B), 1.17e-2 (8B), the
+**Partial kernel 1: logit store** (`p2_qk.qk`, T ≤ 8192). Logits rel L2 vs the torch target: 1.12e-2 (1B), 1.17e-2 (8B), the
 same for the three variants.
 
 Llama-3.2-1B (job 92106):
@@ -152,7 +177,7 @@ Llama-3.1-8B (job 92108):
 | 4096 | 671.2 | **−2.1 %** [−2.4, −2.0] | +0.2 % [+0.0, +0.3] | −0.3 % [−0.5, −0.1] |
 | 8192 | 2186.2 | **−0.4 %** [−0.4, −0.3] | +1.3 % [+1.2, +1.6] | +0.1 % [−0.0, +0.1] |
 
-**QK^T + online softmax** (`p2_fa_stats.qk_stats`, see [Flash-attention endpoint](#flash-attention-endpoint)).
+**Partial kernel 2: QK^T + online softmax** (`p2_fa_stats.qk_stats`, no P.V, no output).
 `m` / `l` vs torch: max abs 1e-6 / max rel 7e-7 for every variant.
 
 Llama-3.2-1B (job 92107):
@@ -184,13 +209,16 @@ Llama-3.1-8B (job 92109):
 - The full flash-attention kernel below uses the MFMA form with a hand-placed schedule, and gets the rank-2
   term to +4–5 % of the FA kernel.
 
-## Flash-attention endpoint
+## Flash-attention endpoints
 
-The results above end at the fp32 logit store, which bounds both pipelines at large T. Flash attention never
-writes the logits, so the rank-2 term is no longer hidden behind the store. Two endpoints were measured on
-Llama-3.1-8B / Llama-3.2-1B shapes, MI350X.
+Partial kernel 1 ends at the fp32 logit store, which bounds both pipelines at large T. Flash attention never
+writes the logits, so the rank-2 term is no longer hidden behind the store. Two flash-attention endpoints were
+measured on Llama-3.1-8B / Llama-3.2-1B shapes, MI350X: a partial one (no P.V) and the full kernel.
 
-### QK^T + online softmax (`bench_fa_proxy.py`)
+### Partial kernel 2: QK^T + online softmax, no P.V, no output
+
+*Partial kernel: P.V and the output are omitted, so the rank-2 term is a larger share of the work than in
+the real kernel (e.g. 1B T = 16384: +20.8 % here, +4.2 % end to end in the full kernel).*
 
 P2 = `p2_fa_stats.qk_stats`: fp4 QK^T, rank-2 term, exact online softmax (row max and row sum), `m` and `l`
 stored. P.V is omitted. Each method is tuned on the end-to-end chain over the rank-2 variants and tiles; median
@@ -214,7 +242,9 @@ of 5 interleaved repeats, one job (91651). `m` / `l` match the torch reference (
 - This kernel computes the softmax only, and its issue schedule is the compiler's. The full kernel below shows
   that the gap is mostly a scheduling / load-path effect, not the rank-2 arithmetic.
 
-### Full flash attention (not yet in this repo)
+### Full flash attention (the real kernel)
+
+*The real attention operator. Code not yet in this repo (see below).*
 
 Kernel: the gfx950 Gluon tutorial `fmha_v3` (rotated 4-cluster warp-pipelined loop, eager online-softmax
 rescale, P.V in fp16 with V through LDS, fp16 O + LSE stores), with the QK^T replaced by the MXFP4
@@ -255,6 +285,28 @@ Caveats (from two independent reviews of the data):
 - On the benchmark inputs the lazy rescale is never needed, so its gain is best case; with the rescale needed
   in 52 % of steps it was checked for correctness only.
 - O is checked against torch at T = 2048 only.
+
+Llama-3.2-1B (head_dim 64; kernel ported to D = 64, code at
+`/shared/ybouquet/rope_frozen/analysis/fa_d64_mfma-place/fmha_d64.py`). Best tile for both methods: 8 warps,
+256 x 128 (BLOCK_N = 128 fits at D = 64). Hadamard: lazy rescale + dot2 fence + early K reads; 2DP: lazy rescale +
+`s_setprio` + dot2 fence. Job 92366 (T = 1024: job 92270), 5 interleaved repeats, O / LSE checked at T = 2048
+and 16384:
+
+| T | FA kernel Had / 2DP (µs) | FA 2DP vs Had | end to end 2DP vs Had |
+|---|---|---|---|
+| 1024 | 16.6 / 17.7 | +6.7 % [+5.2, +8.1] | +1.5 % |
+| 2048 | 37.1 / 39.2 | +5.6 % [+5.5, +5.7] | −1.8 % [−2.0, −1.8] |
+| 4096 | 137.8 / 146.0 | +6.0 % [+5.9, +6.4] | −2.9 % [−2.9, −2.8] |
+| 8192 | 540.0 / 578.7 | +7.2 % [+7.0, +8.1] | +0.9 % [+0.8, +1.0] |
+| 16384 | 2172.2 / 2322.6 | +6.8 % [+6.1, +7.6] | +4.2 % [+3.7, +5.0] |
+
+- The remaining 1B overhead is the rank-2 MFMA itself: at head_dim 64 one fp16 32x32x8 MFMA per 32 x 32 block
+  costs as much as the fp4 QK^T MFMA (~32 cycles each). Diagnostic builds without it are +0–1.5 %.
+- Part of the end-to-end gain is the fused 2DP front end (one kernel) vs Hadamard's two kernels; with equal front
+  ends the end-to-end ratio would be about +2 / +4 / +6 / +6 % at T = 2k–16k (estimate from medians).
+- The `v_dot2` form of the rank-2 term in this kernel costs about +20 % on the FA kernel at 1B: on gfx950 a
+  `v_dot2_f32_f16` takes ~6 cycles and does not overlap the MFMAs (microbenchmark, job 92411), and the softmax
+  already fills the MFMA shadow. Study in progress.
 
 Where the overhead came from (switch-off ablations, wrong outputs, diagnostic only; T = 8192):
 
