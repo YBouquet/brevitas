@@ -244,15 +244,38 @@ of 5 interleaved repeats, one job (91651). `m` / `l` match the torch reference (
 
 ### Full flash attention (the real kernel)
 
-*The real attention operator. Code not yet in this repo (see below).*
+*The real attention operator. Code: [`fa/`](fa/) (see [Run: full flash attention](#run-full-flash-attention)).*
 
 Kernel: the gfx950 Gluon tutorial `fmha_v3` (rotated 4-cluster warp-pipelined loop, eager online-softmax
 rescale, P.V in fp16 with V through LDS, fp16 O + LSE stores), with the QK^T replaced by the MXFP4
 `mfma_scaled` and, for 2DP, the rank-2 term. Softmax scale `1/sqrt(D)` (Hadamard) or `1/(sqrt(D)(1-gamma))`
-(2DP). Non-causal, B = 1, 32 Q / 8 KV heads, D = 128. O matches torch (rel L2 2.8e-4 for both methods).
-The code is at `/shared/ybouquet/rope_frozen/analysis/{fmha_mx,fa_nocvt,fa_coefpref,fa_roof}/`; it depends on
-the tutorial sources and a newer Triton build (see [Toolchain](#toolchain-scheduler-plugin-and-fmha_v4)) and
-will be added here once the variants settle.
+(2DP). Non-causal, B = 1, 32 Q / 8 KV heads, D = 64 (1B) or 128 (8B). O matches torch (rel L2 2.8e-4 for both
+methods). The final kernel for both head dims is [`fa/fmha_d64.py`](fa/fmha_d64.py); at D = 128 it compiles to the
+same instructions as the 8B kernel of job 92099. The intermediate kernels of the 8B K-path table below are not in
+this repo.
+
+#### Run: full flash attention
+
+| file | content |
+|---|---|
+| `fa/fmha_d64.py` | the kernel (`run_mx`): MXFP4 QK^T (`corr=0` Hadamard, `corr=1` 2DP with the rank-2 MFMA), online softmax, P.V, O / LSE; knobs `block_m`, `block_n`, `num_warps`, `lazy`, `prio`, `vf` (dot2 fence, D = 64 only), `lrke`, `r2p`, `exs` |
+| `fa/fmha_roof.py`, `fa/fmha_roof_lds.py`, `fa/fmha_kbank.py` | kernel helpers and the D = 128 code path it reuses |
+| `fa/fa_setup.py` | inputs: runs the front ends of `../` (`p1_2dp`, `had_j2`) once per T |
+| `fa/bench_d64.py` | benchmark: O / LSE vs torch, interleaved timing (FA kernel and end to end), ISA census; sets `readme1b`, `readme8b` |
+
+The kernel imports `fmha_v3.py` / `common.py` from the public gfx950 Gluon tutorial ("High-Performance Gluon
+Kernels on AMD GFX9", `kernels/attention/`, MIT), which is not vendored. Used versions (sha256):
+`fmha_v3.py` 641584fc28bc1dbf6748263f72044de5e8c67fd325c0c5c3b999120ea627eb4f,
+`common.py` 4406e2f9e19c159a587909d096f198c7411e1428f282e7681ad845f617cd2692.
+Triton: the `gfx950-tutorial-v1.0` build, no scheduler plugin.
+
+```bash
+export GLUON_TUTORIAL_ATTENTION_DIR=<tutorial checkout>/kernels/attention
+cd src/brevitas_examples/papers/2dp/kernels/fa
+python bench_d64.py --model 1b --set readme1b --check-ts 2048 16384 --ts 1024 2048 4096 8192 16384 --rounds 5 --e2e
+python bench_d64.py --model 8b --set readme8b --check-ts 2048 16384 --ts 4096 8192 16384 --rounds 5 --e2e \
+    --u-path U_selfgen_8b_2dp_allrand_s0.pt --u-layer 15
+```
 
 Llama-3.1-8B, T = 8192, FA kernel alone, µs, median of 5 interleaved repeats. Every K-path change is applied
 to both methods; the comparison is always fastest Hadamard against fastest 2DP.
@@ -286,8 +309,7 @@ Caveats (from two independent reviews of the data):
   in 52 % of steps it was checked for correctness only.
 - O is checked against torch at T = 2048 only.
 
-Llama-3.2-1B (head_dim 64; kernel ported to D = 64, code at
-`/shared/ybouquet/rope_frozen/analysis/fa_d64_mfma-place/fmha_d64.py`). Best tile for both methods: 8 warps,
+Llama-3.2-1B (head_dim 64; [`fa/fmha_d64.py`](fa/fmha_d64.py), set `readme1b`). Best tile for both methods: 8 warps,
 256 x 128 (BLOCK_N = 128 fits at D = 64). Hadamard: lazy rescale + dot2 fence + early K reads; 2DP: lazy rescale +
 `s_setprio` + dot2 fence. Job 92366 (T = 1024: job 92270), 5 interleaved repeats, O / LSE checked at T = 2048
 and 16384:
