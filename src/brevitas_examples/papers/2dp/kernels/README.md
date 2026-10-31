@@ -379,17 +379,18 @@ reported variant's O / LSE checked at T = 2048 and 8192 (O rel L2 ≤ 2.9e-4):
 | 8B | 8192 | 920.6 / 959.4 / 1029.8 | +4.2 % | +11.6 % [+11.0, +15.0] | −0.8 % | +4.2 % |
 | 8B | 16384 | 3644.1 / 3800.1 / 4145.8 | +4.3 % | +13.6 % [+13.2, +14.0] | +0.8 % | +9.4 % |
 
-Why `v_dot2` costs more here than in partial kernel 1 (preliminary, review pending):
-- The softmax already keeps the vector unit busy (~70 % of cycles in the Hadamard kernel, counters, job 92409), so
-  extra vector instructions add time directly.
+Why `v_dot2` costs more here than in partial kernel 1 (reviewed; jobs 92405–92416):
+- The softmax already keeps the vector unit busy (counted active in ~70 % of cycles in the Hadamard kernel, an upper
+  estimate: the counter is in 4-cycle units; counters, job 92409), so extra vector instructions add time directly.
 - On gfx950 a `v_dot2_f32_f16` costs ~6 cycles and does not overlap the MFMAs, while a plain `v_fma_f32` does as
   long as the MFMA shadow has room (microbenchmark, job 92411). Adding 32 dummy `v_dot2` per tile to the Hadamard
   kernel reproduces most of the `v_dot2` 2DP slowdown (counters, job 92409).
+- The end-to-end `v_dot2` numbers are slightly pessimistic: its front end still writes the padded 8-half coefficient
+  slot of the MFMA form, of which the kernel reads only the first dword.
 - At head_dim 128 (8B) the kernel does twice the MFMA work per logit for the same `v_dot2` count, consistent with the
   smaller relative cost (+12–14 % vs +18–25 % at 1B); not measured separately.
 
-Why the ~30 % of cycles the vector unit is idle does not absorb the `v_dot2` work (preliminary, review pending;
-1B, T = 8192):
+Why the ~30 % of cycles the vector unit is idle does not absorb the `v_dot2` work (reviewed; 1B, T = 8192):
 - The idle cycles are mostly cycles where no wave can issue: the waves spend 36 % of their cycles stalled on LDS data,
   barriers or MFMA results. A SIMD fills an idle cycle only with an instruction from a wave that is ready. This
   kernel runs 2 waves per SIMD, synchronized by `s_barrier` at every stage boundary (the warp-pipelined ping-pong of
@@ -401,10 +402,10 @@ Why the ~30 % of cycles the vector unit is idle does not absorb the `v_dot2` wor
   `v_dot2`s also stop MFMA work from running in parallel with the vector work. Why `v_dot2` breaks that overlap while
   plain fma does not is not measured (3-operand vector ops compete with the MFMAs for register-file read ports, which
   would fit).
-- Removing the barrier lockstep (no warp pipeline) halves the cost of each added `v_dot2`, so the idle cycles become
-  usable, but that kernel starts 24 % slower and is still slower at the 32 `v_dot2` per wave-tile that 2DP needs
-  (break-even around 100). More waves per SIMD (3 or 4) was worse: the tiles must shrink to fit the registers (job
-  92413). Hiding the `v_dot2` work would need a schedule that keeps the pipeline and places the `v_dot2`s in its stall
+- Removing the barrier lockstep (no warp pipeline) brings each added `v_dot2` down to its ~4-cycle issue slot
+  (7.3 cycles with the pipeline), so the ping-pong schedule is what doubles its cost; but that kernel starts about
+  19 % slower and is still slower at the 32 `v_dot2` per wave-tile that 2DP needs. A third wave per SIMD did not
+  help (+18.4 % for 32 dummy `v_dot2` vs +18.9 % with 2 waves, job 92413). Hiding the `v_dot2` work would need a schedule that keeps the pipeline and places the `v_dot2`s in its stall
   windows.
 
 Other `v_dot2` placements (in the QK^T stage, at the head of the softmax, under the P.V MFMAs) were slower; builds
