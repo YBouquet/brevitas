@@ -22,6 +22,10 @@ Full flash attention, 2DP (rank-2 term on MFMA) vs Hadamard, fastest vs fastest,
 | Llama-3.2-1B | 2048 / 4096 / 8192 / 16384 | +5.6 / +6.0 / +7.2 / +6.8 % | −1.8 / −2.9 / +0.9 / +4.2 % | 92366 |
 | Llama-3.1-8B | 4096 / 8192 / 16384 | +4.2 / +4.9 / +4.2 % | −4.6 / −0.9 / +0.9 % | 92099 |
 
+With the rank-2 term on the vector unit (`v_dot2`, one per logit) instead: 1B +18 / +25 / +24 / +23 % on the FA
+kernel and +2 / +9 / +14 / +17 % end to end (T = 2k–16k, job 92415); 8B +13 / +12 / +14 % and 0 / +4 / +9 %
+(T = 4k–16k, job 92416). See [MFMA vs `v_dot2`](#rank-2-term-mfma-vs-v_dot2-full-flash-attention).
+
 | file | content |
 |---|---|
 | `p1_2dp.py` | P1 (Gluon): 8-wave ping-pong projection GEMM with the 2DP epilogue: RoPE, plane coordinates `a' = (1-gamma) a`, MXFP4 of the residual. `epi=0` is a plain fp16 store, used as the Hadamard projection |
@@ -258,10 +262,11 @@ this repo.
 
 | file | content |
 |---|---|
-| `fa/fmha_d64.py` | the kernel (`run_mx`): MXFP4 QK^T (`corr=0` Hadamard, `corr=1` 2DP with the rank-2 MFMA), online softmax, P.V, O / LSE; knobs `block_m`, `block_n`, `num_warps`, `lazy`, `prio`, `vf` (dot2 fence, D = 64 only), `lrke`, `r2p`, `exs` |
+| `fa/fmha_d64.py` | the kernel (`run_mx`): MXFP4 QK^T (`corr=0` Hadamard, `corr=1` 2DP: rank-2 term on MFMA with `vp=0`, on `v_dot2` with `vp=4`), online softmax, P.V, O / LSE; knobs `block_m`, `block_n`, `num_warps`, `lazy`, `prio`, `vf` (dot2 fence, D = 64 only), `lrke`, `r2p`, `exs`, `kch` |
 | `fa/fmha_roof.py`, `fa/fmha_roof_lds.py`, `fa/fmha_kbank.py` | kernel helpers and the D = 128 code path it reuses |
 | `fa/fa_setup.py` | inputs: runs the front ends of `../` (`p1_2dp`, `had_j2`) once per T |
 | `fa/bench_d64.py` | benchmark: O / LSE vs torch, interleaved timing (FA kernel and end to end), ISA census; sets `readme1b`, `readme8b` |
+| `fa/bench_vdot2.py` | Hadamard vs MFMA 2DP vs `v_dot2` 2DP in the same job (implementations `had`, `mf_p0`, `vd_m`, `vd_mk`, ...) |
 
 The kernel imports `fmha_v3.py` / `common.py` from the public gfx950 Gluon tutorial ("High-Performance Gluon
 Kernels on AMD GFX9", `kernels/attention/`, MIT), which is not vendored. Used versions (sha256):
@@ -343,9 +348,74 @@ and 16384:
   costs as much as the fp4 QK^T MFMA (~32 cycles each). Diagnostic builds without it are +0–1.5 %.
 - Part of the end-to-end gain is the fused 2DP front end (one kernel) vs Hadamard's two kernels; with equal front
   ends the end-to-end ratio would be about +2 / +4 / +6 / +6 % at T = 2k–16k (estimate from medians).
-- The `v_dot2` form of the rank-2 term in this kernel costs about +20 % on the FA kernel at 1B: on gfx950 a
-  `v_dot2_f32_f16` takes ~6 cycles and does not overlap the MFMAs (microbenchmark, job 92411), and the softmax
-  already fills the MFMA shadow. Study in progress.
+- The `v_dot2` form of the rank-2 term: see [MFMA vs `v_dot2`](#rank-2-term-mfma-vs-v_dot2-full-flash-attention).
+
+#### Rank-2 term: MFMA vs `v_dot2` (full flash attention)
+
+The same kernel ([`fa/fmha_d64.py`](fa/fmha_d64.py)) computes the 2DP rank-2 term `a'.b` in one of two ways:
+
+- **MFMA** (`vp=0`, the results above): one fp16 32x32x8 MFMA per 32 x 32 score block, coefficients in a
+  zero-padded 8-half slot, fed as the accumulator input of the fp4 QK^T MFMA.
+- **`v_dot2`** (`vp=4`; `kch=1` with 128-key tiles): the vector-unit form, one `v_dot2_f32_f16` per logit.
+  - `a'` (2 fp16 per query row) is packed in one register per lane for the whole kernel; `b` (2 fp16 per key) is
+    one dword per token, copied with each K tile into a 4-deep LDS ring. No padding, no rank-2 MFMA.
+  - The term of the *next* tile is computed in the memory stage (`c0 = a'.b`, accumulator 0) and becomes the
+    accumulator input of that tile's fp4 QK^T MFMA, so the logits are `R + a'.b` with no extra add, and the
+    `v_dot2` instructions stay out of the softmax stage, which is the slowest one.
+  - `kch=1`: with 128-key tiles, `b` is read from LDS per 32-column chunk right before its `v_dot2`s (16 live
+    registers instead of 64), which avoids spills.
+
+Fastest Hadamard vs fastest of each 2DP form, same job per model (1B: 92415, 8B: 92416), 5 interleaved repeats; every
+reported variant's O / LSE checked at T = 2048 and 8192 (O rel L2 ≤ 2.9e-4):
+
+| model | T | FA kernel Had / MFMA / `v_dot2` (µs) | FA: MFMA vs Had | FA: `v_dot2` vs Had | e2e: MFMA vs Had | e2e: `v_dot2` vs Had |
+|---|---|---|---|---|---|---|
+| 1B | 2048 | 37.3 / 39.6 / 44.0 | +6.0 % | +17.7 % [+17.4, +18.3] | −3.9 % | +1.7 % |
+| 1B | 4096 | 138.6 / 146.8 / 172.4 | +6.0 % | +24.5 % [+24.2, +24.7] | −3.0 % | +8.9 % |
+| 1B | 8192 | 545.6 / 581.2 / 675.8 | +6.5 % | +24.0 % [+23.4, +24.3] | +1.1 % | +13.7 % |
+| 1B | 16384 | 2193.7 / 2334.5 / 2685.4 | +6.4 % | +22.6 % [+21.6, +23.2] | +3.8 % | +17.2 % |
+| 8B | 2048 | 60.2 / 63.1 / 67.7 | +4.8 % | +12.4 % [+12.2, +12.7] | −6.1 % | −3.4 % |
+| 8B | 4096 | 229.6 / 239.1 / 259.7 | +4.2 % | +13.1 % [+12.8, +13.3] | −4.6 % | −0.0 % |
+| 8B | 8192 | 920.6 / 959.4 / 1029.8 | +4.2 % | +11.6 % [+11.0, +15.0] | −0.8 % | +4.2 % |
+| 8B | 16384 | 3644.1 / 3800.1 / 4145.8 | +4.3 % | +13.6 % [+13.2, +14.0] | +0.8 % | +9.4 % |
+
+Why `v_dot2` costs more here than in partial kernel 1 (preliminary, review pending):
+- The softmax already keeps the vector unit busy (~70 % of cycles in the Hadamard kernel, counters, job 92409), so
+  extra vector instructions add time directly.
+- On gfx950 a `v_dot2_f32_f16` costs ~6 cycles and does not overlap the MFMAs, while a plain `v_fma_f32` does as
+  long as the MFMA shadow has room (microbenchmark, job 92411). Adding 32 dummy `v_dot2` per tile to the Hadamard
+  kernel reproduces most of the `v_dot2` 2DP slowdown (counters, job 92409).
+- At head_dim 128 (8B) the kernel does twice the MFMA work per logit for the same `v_dot2` count, consistent with the
+  smaller relative cost (+12–14 % vs +18–25 % at 1B); not measured separately.
+
+Why the ~30 % of cycles the vector unit is idle does not absorb the `v_dot2` work (preliminary, review pending;
+1B, T = 8192):
+- The idle cycles are mostly cycles where no wave can issue: the waves spend 36 % of their cycles stalled on LDS data,
+  barriers or MFMA results. A SIMD fills an idle cycle only with an instruction from a wave that is ready. This
+  kernel runs 2 waves per SIMD, synchronized by `s_barrier` at every stage boundary (the warp-pipelined ping-pong of
+  `fmha_v3`), so they tend to stall at the same time. A `v_dot2` sits at a fixed place in its wave's instruction
+  stream; it runs when the wave reaches it, not in the other wave's stall.
+- Measured: each `v_dot2` added to the Hadamard kernel costs its full ~7 cycles of SIMD time (injection test, jobs
+  92406 / 92413). With the 2DP `v_dot2` kernel the SIMD time per wave-tile grows by 352 cycles for 123 more busy
+  vector cycles, and the MFMA / vector overlap drops from 19 % to 6 % of cycles (counters, job 92409): the extra
+  `v_dot2`s also stop MFMA work from running in parallel with the vector work. Why `v_dot2` breaks that overlap while
+  plain fma does not is not measured (3-operand vector ops compete with the MFMAs for register-file read ports, which
+  would fit).
+- Removing the barrier lockstep (no warp pipeline) halves the cost of each added `v_dot2`, so the idle cycles become
+  usable, but that kernel starts 24 % slower and is still slower at the 32 `v_dot2` per wave-tile that 2DP needs
+  (break-even around 100). More waves per SIMD (3 or 4) was worse: the tiles must shrink to fit the registers (job
+  92413). Hiding the `v_dot2` work would need a schedule that keeps the pipeline and places the `v_dot2`s in its stall
+  windows.
+
+Other `v_dot2` placements (in the QK^T stage, at the head of the softmax, under the P.V MFMAs) were slower; builds
+with the scalarize compile flag gave wrong results for some placements and are not used.
+
+```bash
+python bench_vdot2.py --model 1b --only w8m256n128_vf1_lazy w8m256n128_vf1_lazy_prio --impls had mf_p0 vd_mk \
+    --check-ts 2048 8192 --ts 2048 4096 8192 16384 --rounds 5 --e2e
+python bench_vdot2.py --model 8b --only w8m256n64 w8m256n64_lazy_prio --impls had mf_p0 vd_m \
+    --check-ts 2048 8192 --ts 2048 4096 8192 16384 --rounds 5 --e2e --u-path U_selfgen_8b_2dp_allrand_s0.pt --u-layer 15
+```
 
 Where the overhead came from (switch-off ablations, wrong outputs, diagnostic only; T = 8192):
 

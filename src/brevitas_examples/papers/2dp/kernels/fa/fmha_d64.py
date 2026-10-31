@@ -3,7 +3,12 @@
 # Portions derived from fmha_v3.py of the gfx950 Gluon tutorial ("High-Performance Gluon Kernels on AMD GFX9",
 # Copyright (c) 2026 AMD ROCm Software, MIT License: see LICENSE-gluon-tutorial).
 
-"""fmha_kbank generalized to head_dim 64 (Llama-3.2-1B) and to BLOCK_M / BLOCK_N choices; D=128 with BLOCK_N=64 and
+"""fa_vdot2: fa_d64_combo/fmha_d64.py + the v_dot2 2DP implementation (knob VP, see mx_attn_fwd_d64).
+VP 0 = MFMA 2DP (unchanged combo code, placement R2P); VP 1..4 = v_dot2 2DP: exactly one v_dot2_f32_f16 per logit,
+a' pairs of the wave's rows in one register per lane for the whole kernel, b pairs DMA'd with each K tile (one dword
+per token, 4-deep LDS ring indexed tile % 4) and read from LDS; no padded coefficient, no rank-2 MFMA.
+
+fmha_kbank generalized to head_dim 64 (Llama-3.2-1B) and to BLOCK_M / BLOCK_N choices; D=128 with BLOCK_N=64 and
 BLOCK_M=32*num_warps takes exactly the fmha_kbank code path (same layouts, same ops).
 
 D=64 port (both methods):
@@ -154,12 +159,18 @@ def _dma(dst, ptr, off, wid, NOWN: gl.constexpr, NW: gl.constexpr, KPRED: gl.con
 @gluon.jit
 def _ack(k_smem, ks_smem, kc_smem, slot, KP, KS, KC, kp_base, ks_base, kc_base, n0, stride_kpm, stride_ksm,
          stride_kcm, kd_off, ksd_off, kcd_off, wid, CORR: gl.constexpr, KPRED: gl.constexpr, NW: gl.constexpr,
-         NO_K: gl.constexpr, NO_S: gl.constexpr, NO_C: gl.constexpr):
-    """ACK: direct-to-LDS copy of K tile n0 (codes, scales, coefficients) into `slot`. The caller commits."""
+         NO_K: gl.constexpr, NO_S: gl.constexpr, NO_C: gl.constexpr, kb_smem, KCI, kb_base, stride_kim, kbd_off,
+         NO_B: gl.constexpr, VA: gl.constexpr):
+    """ACK: direct-to-LDS copy of K tile n0 (codes, scales, coefficients) into `slot`. The caller commits.
+    CORR (= MF): the 16-B zero-padded MFMA coefficient slot.  VA (v_dot2 2DP): the packed (b0, b1) dword per token
+    into the 4-deep b ring, slot = tile % 4 (so b of a tile stays readable from LDS for 3 more tiles)."""
     _dma(k_smem.index(slot), KP + kp_base + n0 * stride_kpm, kd_off, wid, NO_K, NW, KPRED)
     _dma(ks_smem.index(slot), KS + ks_base + n0 * stride_ksm, ksd_off, wid, NO_S, NW, KPRED)
     if CORR:
         _dma(kc_smem.index(slot), KC + kc_base + n0 * stride_kcm, kcd_off, wid, NO_C, NW, KPRED)
+    if VA:
+        BNK: gl.constexpr = kbd_off.shape[0]
+        _dma(kb_smem.index((n0 // BNK) % 4), KCI + kb_base + n0 * stride_kim, kbd_off, wid, NO_B, NW, KPRED)
 
 
 @gluon.jit
@@ -338,6 +349,127 @@ def _lrk_cf(k_smem, ks_smem, kc_smem, slot, k4_dot: gl.constexpr, ks_lay: gl.con
     return k4, ks4, kc
 
 
+# ---------------- v_dot2 2DP (VALU rank-2: one v_dot2_f32_f16 per logit) ----------------
+@gluon.jit
+def _r2v(qk, qa, kb):
+    """qk + a'.b: one v_dot2_f32_f16 per logit; qa = packed (a0', a1') of the row (int32, held all kernel), kb =
+    packed (b0, b1) of the column (int32, LDS). fp16 products exact in fp32, fp32 accumulate."""
+    return gl.inline_asm_elementwise("v_dot2_f32_f16 $0, $1, $2, $3", "=v,v,v,v", [qa[:, None], kb[None, :], qk],
+                                     dtype=gl.float32, is_pure=True, pack=1)
+
+
+@gluon.jit
+def _r2v0(qa, kb):
+    """a'.b alone (C = inline constant 0): the c0 block that becomes srcC of the fp4 QK^T MFMA."""
+    return gl.inline_asm_elementwise("v_dot2_f32_f16 $0, $1, $2, 0", "=v,v,v", [qa[:, None], kb[None, :]],
+                                     dtype=gl.float32, is_pure=True, pack=1)
+
+
+@gluon.jit
+def _lkb(kb_smem, tile, s_col: gl.constexpr):
+    """b pairs of K tile `tile` from the 4-deep LDS ring (DMA'd with the K tile)."""
+    return cdna4_async.load_shared_relaxed(kb_smem.index(tile % 4), s_col)
+
+
+@gluon.jit
+def _lrkx(k_smem, ks_smem, kc_smem, kb_smem, slot, tile, k4_dot: gl.constexpr, ks_lay: gl.constexpr, cb: gl.constexpr,
+          s_col: gl.constexpr, MF: gl.constexpr, VA: gl.constexpr, SSL: gl.constexpr, NS: gl.constexpr, kpar):
+    """LRK; the third output is the MFMA coefficient operand (MF), the b ring read (VA; the call sites pass VAL =
+    v_dot2 without KCH), or a placeholder."""
+    if VA:
+        k4, ks4 = _lrk_nc(k_smem, ks_smem, slot, k4_dot, ks_lay, SSL, NS, kpar)
+        kc = _lkb(kb_smem, tile, s_col)
+    else:
+        k4, ks4, kc = _lrk(k_smem, ks_smem, kc_smem, slot, k4_dot, ks_lay, cb, MF, SSL, NS, kpar)
+    return k4, ks4, kc
+
+
+@gluon.jit
+def _lrk_cfx(k_smem, ks_smem, kc_smem, kb_smem, slot, tile, k4_dot: gl.constexpr, ks_lay: gl.constexpr,
+             cb: gl.constexpr, s_col: gl.constexpr, MF: gl.constexpr, VAL: gl.constexpr, SSL: gl.constexpr,
+             NS: gl.constexpr, kpar):
+    if VAL:
+        kc = _lkb(kb_smem, tile, s_col)
+        k4, ks4 = _lrk_nc(k_smem, ks_smem, slot, k4_dot, ks_lay, SSL, NS, kpar)
+    elif MF:
+        k4, ks4, kc = _lrk_cf(k_smem, ks_smem, kc_smem, slot, k4_dot, ks_lay, cb, SSL, NS, kpar)
+    else:
+        k4, ks4 = _lrk_nc(k_smem, ks_smem, slot, k4_dot, ks_lay, SSL, NS, kpar)
+        kc = ks4
+    return k4, ks4, kc
+
+
+@gluon.jit
+def _lrkcx(kc_smem, kb_smem, slot, tile, cb: gl.constexpr, s_col: gl.constexpr, MF: gl.constexpr, VAL: gl.constexpr,
+           ph):
+    if VAL:
+        return _lkb(kb_smem, tile, s_col)
+    elif MF:
+        return _lrkc(kc_smem, slot, cb)
+    else:
+        return ph
+
+
+@gluon.jit
+def _lkbc(kb_smem, tile, start: gl.constexpr, s_col: gl.constexpr):
+    """32-column chunk of the b ring (KCH: read just in time, 16 VGPRs live instead of BLOCK_N/2)."""
+    return cdna4_async.load_shared_relaxed(kb_smem.index(tile % 4).slice(start, 32, dim=0), s_col)
+
+
+@gluon.jit
+def _r2v_ch(qk, qa, kb_smem, tile, s_col: gl.constexpr):
+    """qk + a'.b per 32-column chunk, each chunk's b read from the LDS ring right before its v_dot2s."""
+    a, b = _split2(qk)
+    if qk.shape[1] == 64:
+        return _cat2(_r2v(a, qa, _lkbc(kb_smem, tile, 0, s_col)), _r2v(b, qa, _lkbc(kb_smem, tile, 32, s_col)))
+    else:
+        a0, a1 = _split2(a)
+        b0, b1 = _split2(b)
+        return _cat2(_cat2(_r2v(a0, qa, _lkbc(kb_smem, tile, 0, s_col)), _r2v(a1, qa, _lkbc(kb_smem, tile, 32, s_col))),
+                     _cat2(_r2v(b0, qa, _lkbc(kb_smem, tile, 64, s_col)), _r2v(b1, qa, _lkbc(kb_smem, tile, 96, s_col))))
+
+
+@gluon.jit
+def _r2v0_ch(qa, kb_smem, tile, BLOCK_N: gl.constexpr, s_col: gl.constexpr):
+    if BLOCK_N == 64:
+        return _cat2(_r2v0(qa, _lkbc(kb_smem, tile, 0, s_col)), _r2v0(qa, _lkbc(kb_smem, tile, 32, s_col)))
+    else:
+        return _cat2(_cat2(_r2v0(qa, _lkbc(kb_smem, tile, 0, s_col)), _r2v0(qa, _lkbc(kb_smem, tile, 32, s_col))),
+                     _cat2(_r2v0(qa, _lkbc(kb_smem, tile, 64, s_col)), _r2v0(qa, _lkbc(kb_smem, tile, 96, s_col))))
+
+
+@gluon.jit
+def _r2vk(qk, qa, kb, kb_smem, tile, s_col: gl.constexpr, KCH: gl.constexpr):
+    if KCH:
+        return _r2v_ch(qk, qa, kb_smem, tile, s_col)
+    else:
+        return _r2v(qk, qa, kb)
+
+
+@gluon.jit
+def _c0(qcm, kc, qa, kb_smem, tile, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, mr2: gl.constexpr,
+        qk4: gl.constexpr, s_col: gl.constexpr, VA: gl.constexpr, KCH: gl.constexpr):
+    """Rank-2 block alone (srcC of the next fp4 MFMA): MFMA 32x32x8 (MF) or one v_dot2 per logit (VA)."""
+    if VA:
+        if KCH:
+            return gl.convert_layout(_r2v0_ch(qa, kb_smem, tile, BLOCK_N, s_col), qk4)
+        else:
+            return gl.convert_layout(_r2v0(qa, kc), qk4)
+    else:
+        return _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)
+
+
+@gluon.jit
+def _qkv(q4, qs4, k4, ks4, qcm, kc, qa, kb_smem, tile, s_col: gl.constexpr, KCH: gl.constexpr, BLOCK_M: gl.constexpr,
+         BLOCK_N: gl.constexpr, qk4: gl.constexpr, mr2: gl.constexpr, mma_layout: gl.constexpr, MF: gl.constexpr,
+         ks_lay: gl.constexpr, VNOW: gl.constexpr):
+    """fp4 QK^T [+ MFMA rank-2 (MF)] [+ v_dot2 rank-2 right after it (VNOW; kc = b of this tile, or KCH chunks)]."""
+    qk = _qk(q4, qs4, k4, ks4, qcm, kc, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, MF, ks_lay, False)
+    if VNOW:
+        qk = _r2vk(qk, qa, kc, kb_smem, tile, s_col, KCH)
+    return qk
+
+
 @gluon.jit
 def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
                    stride_qpm, stride_qph, stride_qsm, stride_qsh, stride_qcm, stride_qch,
@@ -351,7 +483,8 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
                    KPRED: gl.constexpr, LRKE: gl.constexpr, KSA: gl.constexpr,
                    R2P_: gl.constexpr, PW: gl.constexpr, ABLC: gl.constexpr,
                    LTH: gl.constexpr, VF: gl.constexpr, RV: gl.constexpr, D1F: gl.constexpr,
-                   EXS: gl.constexpr = 0):
+                   EXS: gl.constexpr = 0, QCI=None, KCI=None, stride_qim=0, stride_qih=0, stride_kim=0,
+                   stride_kih=0, VP: gl.constexpr = 0, KCH: gl.constexpr = 0):
     num_warps: gl.constexpr = gl.num_warps()
     gl.static_assert(EXS == 0 or (VF == 1 and not D1F and V1X == 0), "EXS: VF 1, no D1F, V1X 0")
     gl.static_assert(not D1F or (LAZY and V1X == 0), "D1F: lazy rescale (in mem2) only")
@@ -361,7 +494,23 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
     ORIG: gl.constexpr = BLOCK_DMODEL == 128 and BLOCK_N == 64 and BLOCK_M == 32 * num_warps   # fmha_kbank path
     SSL: gl.constexpr = 0 if NS == NSP else (2 if KSA else 1)
     gl.static_assert(NS == NSP or not KSL, "KSL is a D=128 knob")
-    R2P: gl.constexpr = R2P_ if CORR else 0     # Hadamard: no rank-2 term -> identical code for every R2P
+    # ---- 2DP implementation: VP 0 = MFMA (placement R2P_), VP > 0 = v_dot2 on the VALU (one per logit) ----
+    #  VP 1 (a): v_dot2 right after the fp4 QK^T in dot1 (srcC chain of the dot2 instr: qk' = a'.b + qk)
+    #  VP 2 (b): v_dot2 at the head of the softmax in dot2 (b of the tile re-read from the LDS ring in mem1)
+    #  VP 3 (c): next tile's a'.b (C = 0) in dot2 under the P.V MFMAs -> srcC of the next fp4 MFMA (b read in mem1)
+    #  VP 4 (m): next tile's a'.b (C = 0) in mem2 after LRK -> srcC of the next fp4 MFMA
+    MF: gl.constexpr = CORR and VP == 0
+    VA: gl.constexpr = CORR and VP > 0
+    VDOT1: gl.constexpr = VA and VP == 1
+    VB: gl.constexpr = VA and VP == 2
+    VAL: gl.constexpr = VA and not KCH   # KCH 1: b read per 32-column chunk right before its v_dot2s (no LRK-side b read)
+    gl.static_assert(not (VA and D1F), "D1F is an MFMA-only knob")
+    if MF:
+        R2P: gl.constexpr = R2P_
+    elif VA:
+        R2P: gl.constexpr = 3 if VP == 3 else (1 if VP == 4 else 0)   # c0-carry structure shared with the MFMA path
+    else:
+        R2P: gl.constexpr = 0     # Hadamard: no rank-2 term -> identical code for every R2P
     DP: gl.constexpr = 1 if PRIO else None
     MP: gl.constexpr = 0 if PRIO else None
     VEC2_RESC: gl.constexpr = not RESC_MEM
@@ -484,6 +633,17 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
         kcd_off = ksd_off
     wid = gl.arange(0, 64 * num_warps, layout=gl.BlockedLayout([1], [64], [num_warps], [0])) // 64
 
+    s_col: gl.constexpr = gl.SliceLayout(0, mma_layout)
+    s_row: gl.constexpr = gl.SliceLayout(1, mma_layout)
+    kb_dv: gl.constexpr = PaddedSharedLayout.with_identity_for([[BLOCK_N, 4]], [BLOCK_N], [0])
+    kbd_layout: gl.constexpr = dma_layout(kb_dv, 0, num_warps)                  # one dword (b0, b1) per token
+    NO_B: gl.constexpr = n_owner_warps(kbd_layout)
+    kbd_off = gl.arange(0, BLOCK_N, layout=kbd_layout) * stride_kim
+    kb_base = off_h_k * stride_kih
+    if VA:   # a' pairs of this wave's rows: one int32 register per lane, held for the whole kernel
+        qa = gl.load(QCI + off_h_q * stride_qih + (gl.arange(0, BLOCK_M, layout=s_row) + m0) * stride_qim)
+    else:
+        qa = off_h_q
     m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=mma_m_layout)
     l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=mma_m_layout)
     acc = gl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=gl.float32, layout=mma_layout)
@@ -514,6 +674,10 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
     k_smem = gl.allocate_shared_memory(KP.dtype.element_ty, [BUF_DEPTH, KB, BLOCK_N], layout=k_dv)
     ks_smem = gl.allocate_shared_memory(KS.dtype.element_ty, [BUF_DEPTH, BLOCK_N, NSP], layout=ks_dv)
     kc_smem = gl.allocate_shared_memory(KC.dtype.element_ty, [BUF_DEPTH, PW, BLOCK_N], layout=kc_dv)
+    if VA:
+        kb_smem = gl.allocate_shared_memory(gl.int32, [4, BLOCK_N], layout=kb_dv)
+    else:
+        kb_smem = kc_smem
     if KSL:   # read-view aliases (logical block kappa reads physical block swap(kappa))
         k_smem_r = k_smem._reinterpret(layout=k_rd)
         ks_smem_r = ks_smem._reinterpret(layout=ks_rd)
@@ -534,16 +698,16 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
     cdna4_async.wait_group(0)
     # -- Prologue (the tutorial's): K0, V0, K1 | LRK0, qk0, VEC1 | barrier, K2 | LRK1, V1 ----------------
     _ack(k_smem, ks_smem, kc_smem, 0, KP, KS, KC, kp_base, ks_base, kc_base, 0, stride_kpm, stride_ksm, stride_kcm,
-         kd_off, ksd_off, kcd_off, wid, CORR, False, num_warps, NO_K, NO_S, NO_C)
+         kd_off, ksd_off, kcd_off, wid, MF, False, num_warps, NO_K, NO_S, NO_C, kb_smem, KCI, kb_base, stride_kim, kbd_off, NO_B, VA)
     cdna4_async.commit_group()                     # ACK[0]
     cdna4_async.buffer_load_to_shared(v_smem.index(0), v_base, v_off)
     cdna4_async.commit_group()                     # ACV[0]
     _ack(k_smem, ks_smem, kc_smem, 1, KP, KS, KC, kp_base, ks_base, kc_base, BLOCK_N, stride_kpm, stride_ksm,
-         stride_kcm, kd_off, ksd_off, kcd_off, wid, CORR, False, num_warps, NO_K, NO_S, NO_C)
+         stride_kcm, kd_off, ksd_off, kcd_off, wid, MF, False, num_warps, NO_K, NO_S, NO_C, kb_smem, KCI, kb_base, stride_kim, kbd_off, NO_B, VA)
     cdna4_async.commit_group()                     # ACK[1]
     cdna4_async.wait_group(2)                      # K[0]
-    k4, ks4, kc = _lrk(k_smem_r, ks_smem_r, kc_smem, 0, k4_dot, ks_lay, cb, CORR, SSL, NS, kpar)
-    qk = _qk(q4, qs4, k4, ks4, qcm, kc, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, CORR, ks_lay, False)
+    k4, ks4, kc = _lrkx(k_smem_r, ks_smem_r, kc_smem, kb_smem, 0, 0, k4_dot, ks_lay, cb, s_col, MF, VAL, SSL, NS, kpar)
+    qk = _qkv(q4, qs4, k4, ks4, qcm, kc, qa, kb_smem, 0, s_col, KCH, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, MF, ks_lay, VA)
     if EXS > 0:   # same partial form as the loop's dot2: the loop's first dot1 finishes the last EXS slices
         m_new0, xq0 = _v1a(qk, m_i, qk_scale, LAZY, LTH, 1)
         p_c, alpha_c = _v1b_x(xq0, m_i, m_new0, EXS)
@@ -555,12 +719,12 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
         acc, l_i = _resc(acc, l_i, alpha_c, ABL)
     gl.barrier()                                   # WAR: LRK[0] vs K[2]
     _ack(k_smem, ks_smem, kc_smem, 0, KP, KS, KC, kp_base, ks_base, kc_base, 2 * BLOCK_N, stride_kpm, stride_ksm,
-         stride_kcm, kd_off, ksd_off, kcd_off, wid, CORR, False, num_warps, NO_K, NO_S, NO_C)
+         stride_kcm, kd_off, ksd_off, kcd_off, wid, MF, False, num_warps, NO_K, NO_S, NO_C, kb_smem, KCI, kb_base, stride_kim, kbd_off, NO_B, VA)
     cdna4_async.commit_group()                     # ACK[2]
     cdna4_async.wait_group(1)                      # K[1]
-    k4, ks4, kc = _lrk(k_smem_r, ks_smem_r, kc_smem, 1, k4_dot, ks_lay, cb, CORR, SSL, NS, kpar)
+    k4, ks4, kc = _lrkx(k_smem_r, ks_smem_r, kc_smem, kb_smem, 1, 1, k4_dot, ks_lay, cb, s_col, MF, VAL, SSL, NS, kpar)
     if R2P != 0:
-        c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)                    # rank-2 of tile 1 (srcC of the loop's first dot1)
+        c0 = _c0(qcm, kc, qa, kb_smem, 1, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)                    # rank-2 of tile 1 (srcC of the loop's first dot1)
     else:
         c0 = qk                                                          # unused placeholder
     cdna4_async.buffer_load_to_shared(v_smem.index(1), v_base + v_step, v_off)
@@ -573,17 +737,17 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
         with warp_pipeline_stage(L_D1, priority=DP):
             if D1F:   # [rank-2 (R2P 0), row sum] | fence | [fp4 QK^T, fp16 cast]  (lazy / RESC_MEM only)
                 if R2P == 0 and CORR:
-                    c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)
+                    c0 = _c0(qcm, kc, qa, kb_smem, block_n + 2, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)
                 l_i = l_i + gl.sum(p_c, axis=1)
                 l_i = _fence(l_i)
                 if CORR:
                     qk = _qk4(q4, qs4, k4, ks4, c0, mma_layout)
                 else:
-                    qk = _qk(q4, qs4, k4, ks4, qcm, kc, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, CORR, ks_lay, False)
+                    qk = _qkv(q4, qs4, k4, ks4, qcm, kc, qa, kb_smem, block_n + 1, s_col, KCH, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, MF, ks_lay, VDOT1)
                 p_dot = gl.convert_layout(p_c.to(gl.float16), p_dot_layout)
             else:
                 if R2P == 0:
-                    qk = _qk(q4, qs4, k4, ks4, qcm, kc, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, CORR, ks_lay, False)
+                    qk = _qkv(q4, qs4, k4, ks4, qcm, kc, qa, kb_smem, block_n + 1, s_col, KCH, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, MF, ks_lay, VDOT1)
                 else:
                     qk = _qk4(q4, qs4, k4, ks4, c0, mma_layout)
                 if EXS > 0:
@@ -592,19 +756,26 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
                     acc, l_i, p_dot = _v2(acc, l_i, p_c, alpha_c, l_c, p_dot_layout, VEC2_RESC, ABL, V1X)
         cdna4_async.wait_group(WQ1)
         with warp_pipeline_stage(L_M1, priority=MP):
+            if VB and VAL:
+                kbq = _lkb(kb_smem, block_n + 1, s_col)                                   # b of the dot1 tile
             if R2P >= 2:
-                kc = _lrkc(kc_smem, 0, cb)                                                   # coeffs first
+                kc = _lrkcx(kc_smem, kb_smem, 0, block_n + 2, cb, s_col, MF, VAL, ks4)                                                   # coeffs first
             v_dot = cdna4_async.load_shared_relaxed(v_smem.index(0), v_dot_layout)                  # LRV
             if LRKE:
                 if R2P >= 2:
                     k4, ks4 = _lrk_nc(k_smem_r, ks_smem_r, 0, k4_dot, ks_lay, SSL, NS, kpar)
                 else:
-                    k4, ks4, kc = _lrk(k_smem_r, ks_smem_r, kc_smem, 0, k4_dot, ks_lay, cb, CORR, SSL, NS, kpar)
+                    k4, ks4, kc = _lrkx(k_smem_r, ks_smem_r, kc_smem, kb_smem, 0, block_n + 2, k4_dot, ks_lay, cb, s_col, MF, VAL, SSL, NS, kpar)
             _ack(k_smem, ks_smem, kc_smem, 1, KP, KS, KC, kp_base, ks_base, kc_base, (block_n + 3) * BLOCK_N,
-                 stride_kpm, stride_ksm, stride_kcm, kd_off, ksd_off, kcd_off, wid, CORR and not (ABLC & 1), KPRED, num_warps,
-                 NO_K, NO_S, NO_C)                                                                    # ACK
+                 stride_kpm, stride_ksm, stride_kcm, kd_off, ksd_off, kcd_off, wid, MF and not (ABLC & 1), KPRED, num_warps,
+                 NO_K, NO_S, NO_C, kb_smem, KCI, kb_base, stride_kim, kbd_off, NO_B, VA)                                                                    # ACK
             cdna4_async.commit_group()
         with warp_pipeline_stage(L_D2, priority=DP):
+            if VB:
+                if KCH:
+                    qk = _r2v_ch(qk, qa, kb_smem, block_n + 1, s_col)                       # softmax head (chunked b)
+                else:
+                    qk = _r2v(qk, qa, kbq)                                              # softmax head
             if VF == 0:
                 acc = mfma_cdna4(p_dot, v_dot, acc)
                 m_run, p_c, alpha_c, l_c = _v1t(qk, m_run, qk_scale, LAZY, LTH)
@@ -612,11 +783,11 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
                     if ABLC & 2:   # timing ablation: no in-loop rank-2 MFMA (wrong results)
                         c0 = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, layout=qk4)
                     else:
-                        c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)                           # rank-2 in dot2
+                        c0 = _c0(qcm, kc, qa, kb_smem, block_n + 2, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)                           # rank-2 in dot2
             else:   # VF 1: [max, fma] | fence | [P.V, exp2];  VF 2: [max] | fence | [P.V, fma, exp2]
                 #       rank-2 (R2P 3): RV 0 before the fence (head), RV 1 after it (with P.V / exp2; tail)
                 if R2P == 3 and RV == 0:
-                    c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)
+                    c0 = _c0(qcm, kc, qa, kb_smem, block_n + 2, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)
                 m_new, xq = _v1a(qk, m_run, qk_scale, LAZY, LTH, VF)
                 l_i = _fence(l_i)
                 acc = mfma_cdna4(p_dot, v_dot, acc)
@@ -625,7 +796,7 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
                 else:
                     p_c, alpha_c = _v1b(xq, m_run, m_new, qk_scale, VF)
                 if R2P == 3 and RV == 1:
-                    c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)
+                    c0 = _c0(qcm, kc, qa, kb_smem, block_n + 2, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)
                 l_c = alpha_c
                 m_run = m_new
         cdna4_async.wait_group(WQ2)
@@ -634,15 +805,15 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
                 if R2P >= 2:
                     k4, ks4 = _lrk_nc(k_smem_r, ks_smem_r, 0, k4_dot, ks_lay, SSL, NS, kpar)
                 elif R2P == 1:
-                    k4, ks4, kc = _lrk_cf(k_smem_r, ks_smem_r, kc_smem, 0, k4_dot, ks_lay, cb, SSL, NS, kpar)
+                    k4, ks4, kc = _lrk_cfx(k_smem_r, ks_smem_r, kc_smem, kb_smem, 0, block_n + 2, k4_dot, ks_lay, cb, s_col, MF, VAL, SSL, NS, kpar)
                 else:
-                    k4, ks4, kc = _lrk(k_smem_r, ks_smem_r, kc_smem, 0, k4_dot, ks_lay, cb, CORR, SSL, NS, kpar)  # LRK
+                    k4, ks4, kc = _lrkx(k_smem_r, ks_smem_r, kc_smem, kb_smem, 0, block_n + 2, k4_dot, ks_lay, cb, s_col, MF, VAL, SSL, NS, kpar)  # LRK
             if R2P == 2:
-                c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)                                   # rank-2, mem2 head
+                c0 = _c0(qcm, kc, qa, kb_smem, block_n + 2, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)                                   # rank-2, mem2 head
             cdna4_async.buffer_load_to_shared(v_smem.index(0), v_base + (block_n + 2) * v_step, v_off)   # ACV
             cdna4_async.commit_group()
             if R2P == 1:
-                c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)                                   # rank-2, mem2 tail
+                c0 = _c0(qcm, kc, qa, kb_smem, block_n + 2, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)                                   # rank-2, mem2 tail
             if LAZY:
                 acc, l_i = _resc_lazy(acc, l_i, alpha_c)
             elif RESC_MEM:
@@ -651,17 +822,17 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
         with warp_pipeline_stage(L_D1, priority=DP):
             if D1F:   # [rank-2 (R2P 0), row sum] | fence | [fp4 QK^T, fp16 cast]  (lazy / RESC_MEM only)
                 if R2P == 0 and CORR:
-                    c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)
+                    c0 = _c0(qcm, kc, qa, kb_smem, block_n + 3, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)
                 l_i = l_i + gl.sum(p_c, axis=1)
                 l_i = _fence(l_i)
                 if CORR:
                     qk = _qk4(q4, qs4, k4, ks4, c0, mma_layout)
                 else:
-                    qk = _qk(q4, qs4, k4, ks4, qcm, kc, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, CORR, ks_lay, False)
+                    qk = _qkv(q4, qs4, k4, ks4, qcm, kc, qa, kb_smem, block_n + 2, s_col, KCH, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, MF, ks_lay, VDOT1)
                 p_dot = gl.convert_layout(p_c.to(gl.float16), p_dot_layout)
             else:
                 if R2P == 0:
-                    qk = _qk(q4, qs4, k4, ks4, qcm, kc, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, CORR, ks_lay, False)
+                    qk = _qkv(q4, qs4, k4, ks4, qcm, kc, qa, kb_smem, block_n + 2, s_col, KCH, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, MF, ks_lay, VDOT1)
                 else:
                     qk = _qk4(q4, qs4, k4, ks4, c0, mma_layout)
                 if EXS > 0:
@@ -670,19 +841,26 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
                     acc, l_i, p_dot = _v2(acc, l_i, p_c, alpha_c, l_c, p_dot_layout, VEC2_RESC, ABL, V1X)
         cdna4_async.wait_group(WQ1)
         with warp_pipeline_stage(L_M1, priority=MP):
+            if VB and VAL:
+                kbq = _lkb(kb_smem, block_n + 2, s_col)                                   # b of the dot1 tile
             if R2P >= 2:
-                kc = _lrkc(kc_smem, 1, cb)                                                   # coeffs first
+                kc = _lrkcx(kc_smem, kb_smem, 1, block_n + 3, cb, s_col, MF, VAL, ks4)                                                   # coeffs first
             v_dot = cdna4_async.load_shared_relaxed(v_smem.index(1), v_dot_layout)                  # LRV
             if LRKE:
                 if R2P >= 2:
                     k4, ks4 = _lrk_nc(k_smem_r, ks_smem_r, 1, k4_dot, ks_lay, SSL, NS, kpar)
                 else:
-                    k4, ks4, kc = _lrk(k_smem_r, ks_smem_r, kc_smem, 1, k4_dot, ks_lay, cb, CORR, SSL, NS, kpar)
+                    k4, ks4, kc = _lrkx(k_smem_r, ks_smem_r, kc_smem, kb_smem, 1, block_n + 3, k4_dot, ks_lay, cb, s_col, MF, VAL, SSL, NS, kpar)
             _ack(k_smem, ks_smem, kc_smem, 0, KP, KS, KC, kp_base, ks_base, kc_base, (block_n + 4) * BLOCK_N,
-                 stride_kpm, stride_ksm, stride_kcm, kd_off, ksd_off, kcd_off, wid, CORR and not (ABLC & 1), KPRED, num_warps,
-                 NO_K, NO_S, NO_C)                                                                    # ACK
+                 stride_kpm, stride_ksm, stride_kcm, kd_off, ksd_off, kcd_off, wid, MF and not (ABLC & 1), KPRED, num_warps,
+                 NO_K, NO_S, NO_C, kb_smem, KCI, kb_base, stride_kim, kbd_off, NO_B, VA)                                                                    # ACK
             cdna4_async.commit_group()
         with warp_pipeline_stage(L_D2, priority=DP):
+            if VB:
+                if KCH:
+                    qk = _r2v_ch(qk, qa, kb_smem, block_n + 2, s_col)                       # softmax head (chunked b)
+                else:
+                    qk = _r2v(qk, qa, kbq)                                              # softmax head
             if VF == 0:
                 acc = mfma_cdna4(p_dot, v_dot, acc)
                 m_run, p_c, alpha_c, l_c = _v1t(qk, m_run, qk_scale, LAZY, LTH)
@@ -690,11 +868,11 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
                     if ABLC & 2:   # timing ablation: no in-loop rank-2 MFMA (wrong results)
                         c0 = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, layout=qk4)
                     else:
-                        c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)                           # rank-2 in dot2
+                        c0 = _c0(qcm, kc, qa, kb_smem, block_n + 3, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)                           # rank-2 in dot2
             else:   # VF 1: [max, fma] | fence | [P.V, exp2];  VF 2: [max] | fence | [P.V, fma, exp2]
                 #       rank-2 (R2P 3): RV 0 before the fence (head), RV 1 after it (with P.V / exp2; tail)
                 if R2P == 3 and RV == 0:
-                    c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)
+                    c0 = _c0(qcm, kc, qa, kb_smem, block_n + 3, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)
                 m_new, xq = _v1a(qk, m_run, qk_scale, LAZY, LTH, VF)
                 l_i = _fence(l_i)
                 acc = mfma_cdna4(p_dot, v_dot, acc)
@@ -703,7 +881,7 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
                 else:
                     p_c, alpha_c = _v1b(xq, m_run, m_new, qk_scale, VF)
                 if R2P == 3 and RV == 1:
-                    c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)
+                    c0 = _c0(qcm, kc, qa, kb_smem, block_n + 3, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)
                 l_c = alpha_c
                 m_run = m_new
         cdna4_async.wait_group(WQ2)
@@ -712,15 +890,15 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
                 if R2P >= 2:
                     k4, ks4 = _lrk_nc(k_smem_r, ks_smem_r, 1, k4_dot, ks_lay, SSL, NS, kpar)
                 elif R2P == 1:
-                    k4, ks4, kc = _lrk_cf(k_smem_r, ks_smem_r, kc_smem, 1, k4_dot, ks_lay, cb, SSL, NS, kpar)
+                    k4, ks4, kc = _lrk_cfx(k_smem_r, ks_smem_r, kc_smem, kb_smem, 1, block_n + 3, k4_dot, ks_lay, cb, s_col, MF, VAL, SSL, NS, kpar)
                 else:
-                    k4, ks4, kc = _lrk(k_smem_r, ks_smem_r, kc_smem, 1, k4_dot, ks_lay, cb, CORR, SSL, NS, kpar)  # LRK
+                    k4, ks4, kc = _lrkx(k_smem_r, ks_smem_r, kc_smem, kb_smem, 1, block_n + 3, k4_dot, ks_lay, cb, s_col, MF, VAL, SSL, NS, kpar)  # LRK
             if R2P == 2:
-                c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)                                   # rank-2, mem2 head
+                c0 = _c0(qcm, kc, qa, kb_smem, block_n + 3, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)                                   # rank-2, mem2 head
             cdna4_async.buffer_load_to_shared(v_smem.index(1), v_base + (block_n + 3) * v_step, v_off)   # ACV
             cdna4_async.commit_group()
             if R2P == 1:
-                c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)                                   # rank-2, mem2 tail
+                c0 = _c0(qcm, kc, qa, kb_smem, block_n + 3, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)                                   # rank-2, mem2 tail
             if LAZY:
                 acc, l_i = _resc_lazy(acc, l_i, alpha_c)
             elif RESC_MEM:
@@ -730,7 +908,7 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
         block_n = block_start + main_loop_pairs * 2
         with warp_pipeline_stage(L_D1, priority=DP):
             if R2P == 0:
-                qk = _qk(q4, qs4, k4, ks4, qcm, kc, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, CORR, ks_lay, False)
+                qk = _qkv(q4, qs4, k4, ks4, qcm, kc, qa, kb_smem, block_n + 1, s_col, KCH, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, MF, ks_lay, VA)
             else:
                 qk = _qk4(q4, qs4, k4, ks4, c0, mma_layout)
             if EXS > 0:   # p_c comes from the loop's last dot2 (EXS slices still raw)
@@ -741,17 +919,17 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
         with warp_pipeline_stage(L_M1, priority=MP):
             v_dot = cdna4_async.load_shared_relaxed(v_smem.index(0), v_dot_layout)
             _ack(k_smem, ks_smem, kc_smem, 1, KP, KS, KC, kp_base, ks_base, kc_base, (block_n + 3) * BLOCK_N,
-                 stride_kpm, stride_ksm, stride_kcm, kd_off, ksd_off, kcd_off, wid, CORR, False, num_warps,
-                 NO_K, NO_S, NO_C)
+                 stride_kpm, stride_ksm, stride_kcm, kd_off, ksd_off, kcd_off, wid, MF, False, num_warps,
+                 NO_K, NO_S, NO_C, kb_smem, KCI, kb_base, stride_kim, kbd_off, NO_B, VA)
             cdna4_async.commit_group()
         with warp_pipeline_stage(L_D2, priority=DP):
             acc = mfma_cdna4(p_dot, v_dot, acc)
             m_run, p_c, alpha_c, l_c = _v1t(qk, m_run, qk_scale, LAZY, LTH)
         cdna4_async.wait_group(1)
         with warp_pipeline_stage(L_M2, priority=MP):
-            k4, ks4, kc = _lrk(k_smem_r, ks_smem_r, kc_smem, 0, k4_dot, ks_lay, cb, CORR, SSL, NS, kpar)
+            k4, ks4, kc = _lrkx(k_smem_r, ks_smem_r, kc_smem, kb_smem, 0, block_n + 2, k4_dot, ks_lay, cb, s_col, MF, VAL, SSL, NS, kpar)
             if R2P != 0:
-                c0 = _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)
+                c0 = _c0(qcm, kc, qa, kb_smem, block_n + 2, BLOCK_M, BLOCK_N, mr2, qk4, s_col, VA, KCH)
             cdna4_async.buffer_load_to_shared(v_smem.index(0), v_base + (block_n + 2) * v_step, v_off)
             cdna4_async.commit_group()
             if RESC_MEM:
@@ -765,7 +943,7 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
     s_nm2 = ((nm2 - block_start) % BUF_DEPTH).to(tl.int32)
     s_nm1 = ((nm1 - block_start) % BUF_DEPTH).to(tl.int32)
     if R2P == 0:
-        qk = _qk(q4, qs4, k4, ks4, qcm, kc, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, CORR, ks_lay, False)   # qk[n-2]
+        qk = _qkv(q4, qs4, k4, ks4, qcm, kc, qa, kb_smem, nm2, s_col, KCH, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, MF, ks_lay, VA)   # qk[n-2]
     else:
         qk = _qk4(q4, qs4, k4, ks4, c0, mma_layout)
 
@@ -783,8 +961,8 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
     cdna4_async.buffer_load_to_shared(v_smem.index(s_nm1), v_base + nm1 * v_step, v_off)
     cdna4_async.commit_group()                                                               # ACV[n-1]
     cdna4_async.wait_group(2)                                                                # K[n-1]
-    k4, ks4, kc = _lrk(k_smem_r, ks_smem_r, kc_smem, s_nm1, k4_dot, ks_lay, cb, CORR, SSL, NS, kpar)
-    qk = _qk(q4, qs4, k4, ks4, qcm, kc, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, CORR, ks_lay, False)   # qk[n-1]
+    k4, ks4, kc = _lrkx(k_smem_r, ks_smem_r, kc_smem, kb_smem, s_nm1, nm1, k4_dot, ks_lay, cb, s_col, MF, VAL, SSL, NS, kpar)
+    qk = _qkv(q4, qs4, k4, ks4, qcm, kc, qa, kb_smem, nm1, s_col, KCH, BLOCK_M, BLOCK_N, qk4, mr2, mma_layout, MF, ks_lay, VA)   # qk[n-1]
     cdna4_async.wait_group(1)                                                                # V[n-2]
     v_dot = cdna4_async.load_shared_relaxed(v_smem.index(s_nm2), v_dot_layout)
     acc, l_i, p_dot = _v2(acc, l_i, p_c, alpha_c, l_c, p_dot_layout, VEC2_RESC, ABL, V1X)
@@ -811,7 +989,7 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
 def run_mx(qp, qs, qc, kp, ks, kc, v, out, lse, sm_scale, corr, num_warps=8, wpe=2, agpr0=True, resc_mem=0, prio=0,
            envtag=0, abl=0, v1x=0, lazy=0, ksl=0, kcf=0, kcl=0, wq1=1, wq2=1, kpred=0, lrke=0, ksa=0, block_m=None,
            block_n=64, r2p=0, ablc=0, lth=8.0, vf=0, ftz=0, sched="",
-           rv=0, d1f=0, exs=0, **_ignored):
+           rv=0, d1f=0, exs=0, vp=0, kch=0, **_ignored):
     T, n_q, KBv = qp.shape
     n_kv = kp.shape[1]
     D = 2 * KBv
@@ -825,14 +1003,24 @@ def run_mx(qp, qs, qc, kp, ks, kc, v, out, lse, sm_scale, corr, num_warps=8, wpe
     assert T // block_n >= 4
     assert not exs or (vf == 1 and T // block_n >= 5), "EXS needs VF 1 and >= 1 main-loop pair"
     assert abl == 0 and v1x == 0, "timing ablations / V1X are not ported"
+    import torch
     if qc is None:   # Hadamard: no coefficients; pass the fp16 V view so KC has a half dtype (never read)
         qc, kc = qs, v
         sqc, skc = (0, 0), (0, 0)
         pw = 8
+        qci = kci = v.view(torch.int32)
+        sqi, ski = (0, 0), (0, 0)
+        vp = 0
     else:
         pw = kc.stride(0)
         assert pw in (8, 16) and qc.stride(0) == pw
         sqc, skc = (qc.stride(0), qc.stride(1)), (kc.stride(0), kc.stride(1))
+        # v_dot2: (a0', a1') / (b0, b1) as ONE int32 per token = the first dword of the coefficient slot (P1 output,
+        # no padded coefficient is ever read)
+        assert qc.shape[-1] == 2 and qc.stride(-1) == 1 and kc.stride(-1) == 1
+        qci, kci = qc.view(torch.int32)[..., 0], kc.view(torch.int32)[..., 0]
+        sqi, ski = (qci.stride(0), qci.stride(1)), (kci.stride(0), kci.stride(1))
+        assert vp in (0, 1, 2, 3, 4) and not (vp and d1f)
     grid = (n_q, triton.cdiv(T, block_m), 1)
     fa = ((("amdgpu-agpr-alloc", "0,0"),) if agpr0 else ())
     if ftz:   # FP32 denormals flushed (MODE register): exp2 underflow and packed-f32 ops never see denormals
@@ -848,4 +1036,4 @@ def run_mx(qp, qs, qc, kp, ks, kc, v, out, lse, sm_scale, corr, num_warps=8, wpe
                                  BLOCK_N=block_n, CORR=bool(corr), RESC_MEM=bool(resc_mem or lazy), PRIO=bool(prio),
                                  ENVTAG=envtag, ABL=abl, V1X=v1x, LAZY=int(lazy), KSL=int(ksl), KCF=int(kcf),
                                  KCL=int(kcl), WQ1=int(wq1), WQ2=int(wq2), KPRED=int(kpred), LRKE=int(lrke),
-                                 KSA=int(ksa), R2P_=int(r2p), PW=pw, ABLC=int(ablc), LTH=float(lth), VF=int(vf), RV=int(rv), D1F=int(d1f), EXS=int(exs), num_warps=num_warps, waves_per_eu=wpe, **kw)
+                                 KSA=int(ksa), R2P_=int(r2p), PW=pw, ABLC=int(ablc), LTH=float(lth), VF=int(vf), RV=int(rv), D1F=int(d1f), EXS=int(exs), QCI=qci, KCI=kci, stride_qim=sqi[0], stride_qih=sqi[1], stride_kim=ski[0], stride_kih=ski[1], VP=int(vp), KCH=int(kch), num_warps=num_warps, waves_per_eu=wpe, **kw)
