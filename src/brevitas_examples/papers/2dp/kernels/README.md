@@ -277,6 +277,23 @@ python bench_d64.py --model 8b --set readme8b --check-ts 2048 16384 --ts 4096 81
     --u-path U_selfgen_8b_2dp_allrand_s0.pt --u-layer 15
 ```
 
+Reproduced from this directory (job 92422, one job for both models, 5 interleaved repeats; every variant's O / LSE
+checked at T = 2048 and 16384, O rel L2 ≤ 2.9e-4), fastest Hadamard vs fastest 2DP:
+
+| model | T | FA kernel Had / 2DP (µs) | FA 2DP vs Had | end to end 2DP vs Had |
+|---|---|---|---|---|
+| 1B | 2048 | 36.5 / 38.5 | +5.4 % [+4.6, +6.0] | −4.7 % [−5.0, −4.6] |
+| 1B | 4096 | 134.7 / 143.2 | +6.1 % [+5.9, +6.3] | −2.5 % [−2.6, −2.3] |
+| 1B | 8192 | 523.0 / 558.9 | +6.9 % [+6.6, +7.0] | +1.4 % [+1.1, +1.4] |
+| 1B | 16384 | 2105.0 / 2241.5 | +6.4 % [+6.0, +7.3] | +3.8 % [+3.0, +4.2] |
+| 8B | 4096 | 223.4 / 231.4 | +3.7 % [+3.5, +3.8] | −4.5 % [−4.8, −4.3] |
+| 8B | 8192 | 880.5 / 918.9 | +4.4 % [+4.3, +4.6] | −0.6 % [−1.7, +0.2] |
+| 8B | 16384 | 3556.2 / 3696.4 | +3.7 % [+3.3, +4.8] | +0.6 % [−0.4, +0.9] |
+
+Within noise of the original jobs (92366 for 1B, 92099 for 8B); the 1B T = 2048 end-to-end ratio is known to move
+by about ±2 points between jobs. The `readme1b` set has only the 256 x 128 tile, which is not the fastest at
+T = 1024 (job 92270 used 4 warps, 128 x 128 there).
+
 Llama-3.1-8B, T = 8192, FA kernel alone, µs, median of 5 interleaved repeats. Every K-path change is applied
 to both methods; the comparison is always fastest Hadamard against fastest 2DP.
 
