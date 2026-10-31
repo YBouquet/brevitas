@@ -437,8 +437,11 @@ which fp4 cannot do. Equal treatment of fp16 and MXFP4:
   configurations that spill registers are excluded;
 - every timed variant's O / LSE checked against torch at T = 2048 and 16384.
 
-Parity check: the tutorial `fmha_v3` (head_dim 128 only; it does not compile at 64) is within noise of our fp16 mode
-at 8B (fastest vs fastest, ours / tutorial 0.999–1.005 at T = 2k–16k), so the fp16 baseline is not handicapped.
+Parity check against the tutorial `fmha_v3` (head_dim 128 only; it does not compile at 64; it is a reference, never
+the baseline). At 8B the tutorial was first about 0.4 % faster than our fp16 mode (job 92423): our drain code spilled
+registers under the scalarize compile flag. Scheduling fences between the drain steps (`drf`, offered to every method,
+MXFP4 included) remove the spill; with them, our fp16 is as fast as or slightly faster than the tutorial (tutorial /
+ours 1.003–1.007 with graph timing, T = 2k–16k, job 92429), and the main loops are instruction-for-instruction the same.
 
 FA kernel alone, µs, 5 interleaved repeats, speedup = fp16 time / MXFP4 time (median [min, max] of per-repeat ratios);
 jobs 92428 (1B) and 92429 (8B). 2DP is the MFMA form.
@@ -454,8 +457,14 @@ jobs 92428 (1B) and 92429 (8B). 2DP is the MFMA form.
 | 8B | 8192 | 1221.3 | 913.4 | 947.8 | 1.34x [1.32, 1.34] | 1.29x [1.28, 1.29] |
 | 8B | 16384 | 4831.1 | 3649.4 | 3762.5 | 1.32x [1.31, 1.33] | 1.29x [1.28, 1.29] |
 
-Timing with CUDA-graph replay (no host launch overhead) gives the same picture: Hadamard 1.29–1.34x, 2DP 1.22–1.29x.
-The `v_dot2` form of 2DP is not in this comparison yet. Review of this comparison is pending.
+Timing with CUDA-graph replay (no host launch overhead) gives the same picture: Hadamard 1.29–1.32x (1B) and
+1.31–1.34x (8B), 2DP 1.21–1.23x (1B) and 1.28–1.30x (8B). Allowing configurations that spill outside the main loop
+changes nothing at 8B and lowers the 1B speedups by at most 0.02x.
+
+Caveats: at 1B nothing outside our kernel confirms that its fp16 mode is competitive (the tutorial does not compile
+at head_dim 64); its fp16 Q takes more registers than the MXFP4 Q, and no fp16-specific register saving was tried
+(estimated remaining fp16 upside ≤ 2 % at 1B). 2DP's extra rank-2 MFMA is not counted in its TF/s. The `v_dot2` form
+of 2DP is not in this comparison.
 
 ```bash
 python bench_fp.py --model 1b --mode full --ts 2048 4096 8192 16384 --check-ts 2048 16384 --rounds 5 --screen-t 8192

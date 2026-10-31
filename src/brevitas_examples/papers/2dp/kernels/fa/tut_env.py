@@ -4,7 +4,8 @@
 """fmha_v3_env: the tutorial's fmha_v3 (from $GLUON_TUTORIAL_ATTENTION_DIR, not vendored) with three edits applied at
 import time, for the fp16 parity reference of bench_fp.py:
   * an unused ENVTAG constexpr, so each compile-time env (nosink / scal) compiles separately;
-  * run_gluon_attention(..., envtag=0, M=None): the LSE buffer M can be preallocated (no allocation in the timed call).
+  * run_gluon_attention(..., envtag=0, M=None): the LSE buffer M can be preallocated (no allocation in the timed call),
+    and the compiled kernel is returned (ISA dump).
 The kernel body is unchanged."""
 import importlib.util
 import os
@@ -24,6 +25,7 @@ def load():
          "    if M is None:\n        M = torch.empty((batch, nheads_q, metadata.max_seqlens_q), device=q.device, "
          "dtype=torch.float32)\n"),
         ("        SCALE_ON_Q=scale_on_q,\n    )", "        SCALE_ON_Q=scale_on_q,\n        ENVTAG=envtag,\n    )"),
+        ("    gluon_attn_fwd[grid](", "    return gluon_attn_fwd[grid]("),   # the compiled kernel, for the ISA dump
     ]
     for a, b in edits:
         assert src.count(a) == 1, f"tutorial fmha_v3.py does not match the expected version: {a[:50]!r}"
