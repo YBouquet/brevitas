@@ -350,6 +350,47 @@ def _lrk_cf(k_smem, ks_smem, kc_smem, slot, k4_dot: gl.constexpr, ks_lay: gl.con
 
 
 # ---------------- v_dot2 2DP (VALU rank-2: one v_dot2_f32_f16 per logit) ----------------
+# MFMA / DOT hazards (CDNA4 ISA sec. 7.6). LLVM inserts no wait states around inline asm, so every v_dot2 group is
+# fenced explicitly (one s_nop asm statement tied to ALL registers of the lane's block, _hzf):
+#  - post-add form (qk = fp4 MFMA result, read as srcC and overwritten): HZW waits before (XDL write -> VALU read /
+#    write: 8-pass fp4 MFMA 12, 16-pass worst case 20; srcC read -> VALU write 15);
+#  - after every group (post-add and c0): DOTW waits (DOT write -> other VALU read 3, LLVM DotWriteDifferentVALURead;
+#    VALU write -> MFMA srcC read 2).
+HZW = gl.constexpr(20)
+DOTW = gl.constexpr(3)
+
+
+@constexpr_function
+def _fence_asm(waits):
+    out = []
+    while waits > 0:
+        k = min(waits, 8)
+        out.append(f"s_nop {k - 1}")
+        waits -= k
+    return "\n\t".join(out)
+
+
+@constexpr_function
+def _fence_cons(n):
+    return ",".join(["=v"] * n + [str(i) for i in range(n)])
+
+
+@constexpr_function
+def _per_lane(shape, nw):
+    n = 1
+    for d in shape:
+        n *= int(d)
+    return n // (64 * int(nw))
+
+
+@gluon.jit
+def _hzf(x, WAITS: gl.constexpr):
+    """x unchanged, after an s_nop fence of WAITS wait states that every register of x (all elements of the lane, one
+    asm statement) depends on: a consumer of x issues >= WAITS wait states after the last producer of x."""
+    E: gl.constexpr = _per_lane(x.shape, gl.num_warps())
+    return gl.inline_asm_elementwise(_fence_asm(WAITS), _fence_cons(E), [x], dtype=gl.float32, is_pure=True, pack=E)
+
+
 @gluon.jit
 def _r2v(qk, qa, kb):
     """qk + a'.b: one v_dot2_f32_f16 per logit; qa = packed (a0', a1') of the row (int32, held all kernel), kb =
@@ -440,10 +481,13 @@ def _r2v0_ch(qa, kb_smem, tile, BLOCK_N: gl.constexpr, s_col: gl.constexpr):
 
 @gluon.jit
 def _r2vk(qk, qa, kb, kb_smem, tile, s_col: gl.constexpr, KCH: gl.constexpr):
+    """Post-add form (qk = fp4 MFMA result, read and overwritten by the v_dot2s), fenced on both sides."""
+    qk = _hzf(qk, HZW)
     if KCH:
-        return _r2v_ch(qk, qa, kb_smem, tile, s_col)
+        qk = _r2v_ch(qk, qa, kb_smem, tile, s_col)
     else:
-        return _r2v(qk, qa, kb)
+        qk = _r2v(qk, qa, kb)
+    return _hzf(qk, DOTW)
 
 
 @gluon.jit
@@ -452,9 +496,10 @@ def _c0(qcm, kc, qa, kb_smem, tile, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr
     """Rank-2 block alone (srcC of the next fp4 MFMA): MFMA 32x32x8 (MF) or one v_dot2 per logit (VA)."""
     if VA:
         if KCH:
-            return gl.convert_layout(_r2v0_ch(qa, kb_smem, tile, BLOCK_N, s_col), qk4)
+            c = gl.convert_layout(_r2v0_ch(qa, kb_smem, tile, BLOCK_N, s_col), qk4)
         else:
-            return gl.convert_layout(_r2v0(qa, kc), qk4)
+            c = gl.convert_layout(_r2v0(qa, kc), qk4)
+        return _hzf(c, DOTW)   # DOT write -> MFMA srcC read (2) / other VALU read (3)
     else:
         return _r2(qcm, kc, BLOCK_M, BLOCK_N, mr2, qk4)
 
@@ -773,9 +818,9 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
         with warp_pipeline_stage(L_D2, priority=DP):
             if VB:
                 if KCH:
-                    qk = _r2v_ch(qk, qa, kb_smem, block_n + 1, s_col)                       # softmax head (chunked b)
+                    qk = _r2vk(qk, qa, qk, kb_smem, block_n + 1, s_col, 1)                       # softmax head (chunked b)
                 else:
-                    qk = _r2v(qk, qa, kbq)                                              # softmax head
+                    qk = _r2vk(qk, qa, kbq, kb_smem, 0, s_col, 0)                                              # softmax head
             if VF == 0:
                 acc = mfma_cdna4(p_dot, v_dot, acc)
                 m_run, p_c, alpha_c, l_c = _v1t(qk, m_run, qk_scale, LAZY, LTH)
@@ -858,9 +903,9 @@ def mx_attn_fwd_d64(QP, QS, QC, KP, KS, KC, V, SM_SCALE: gl.constexpr, L, Out,
         with warp_pipeline_stage(L_D2, priority=DP):
             if VB:
                 if KCH:
-                    qk = _r2v_ch(qk, qa, kb_smem, block_n + 2, s_col)                       # softmax head (chunked b)
+                    qk = _r2vk(qk, qa, qk, kb_smem, block_n + 2, s_col, 1)                       # softmax head (chunked b)
                 else:
-                    qk = _r2v(qk, qa, kbq)                                              # softmax head
+                    qk = _r2vk(qk, qa, kbq, kb_smem, 0, s_col, 0)                                              # softmax head
             if VF == 0:
                 acc = mfma_cdna4(p_dot, v_dot, acc)
                 m_run, p_c, alpha_c, l_c = _v1t(qk, m_run, qk_scale, LAZY, LTH)

@@ -450,6 +450,14 @@ The same kernel ([`fa/fmha_d64.py`](fa/fmha_d64.py)) computes the 2DP rank-2 ter
 - **MFMA** (`vp=0`, the results above): one fp16 32x32x8 MFMA per 32 x 32 score block, coefficients in a
   zero-padded 8-half slot, fed as the accumulator input of the fp4 QK^T MFMA.
 - **`v_dot2`** (`vp=4`; `kch=1` with 128-key tiles): the vector-unit form, one `v_dot2_f32_f16` per logit.
+
+**Hazard fix (applies to the `v_dot2` tables of this section, jobs 92415 / 92416).** Those builds lacked hardware wait
+states around the inline-asm `v_dot2` (LLVM inserts none for inline asm): MFMA result -> `v_dot2` read in the prologue /
+drain, and the DOT-write -> other-VALU-read rule (3 waits, LLVM's `DotWriteDifferentVALURead`). Their outputs are
+non-deterministic (on rerun 44 of 60 checks at 8B and 26 of 70 at 1B changed; most still passed the tolerance). The
+kernel in [`fa/fmha_d64.py`](fa/fmha_d64.py) now fences every `v_dot2` group with `s_nop`; it passes every check at
+T = 2048, 8192 and 16384, is bitwise reproducible, and costs about 1 point more; the MFMA (`vp=0`) and Hadamard code
+is instruction-identical to the previous kernel. Fixed numbers: [`v_dot2` with the hazard fix](#v_dot2-with-the-hazard-fix).
   - `a'` (2 fp16 per query row) is packed in one register per lane for the whole kernel; `b` (2 fp16 per key) is
     one dword per token, copied with each K tile into a 4-deep LDS ring. No padding, no rank-2 MFMA.
   - The term of the *next* tile is computed in the memory stage (`c0 = a'.b`, accumulator 0) and becomes the
@@ -670,9 +678,97 @@ Fastest of each (jobs 92444 1B / 92445 8B, 5 interleaved repeats, µs; ratios me
   kernel, the pair loses (+3 to +7 % on the FA kernel vs `v_dot2`).
 - A full-rate pair (`v_mul_f32` then `v_fmac_f32`, ~2 x 2.25 cycles) would avoid both, but needs `b` in fp32 (more
   registers in kernels already at 254–256 VGPRs) and conflict-free register banks; not tested.
-- Correctness note: inline-asm vector ops get no compiler-inserted MFMA wait states. In the `v_dot2` kernel the
-  prologue and drain read an MFMA result right after it is produced (static audit); this is the likely cause of the
-  variants that fail the correctness check, which are excluded everywhere.
+- Correctness note: inline-asm vector ops get no compiler-inserted wait states; the missing ones in the `v_dot2`
+  kernel caused the failing variants and non-deterministic outputs. Fixed: see the next section.
+
+#### `v_dot2` with the hazard fix
+
+Jobs 92480 (1B) and 92479 (8B), random U at 8B; full `bench_vdot2.py` grid; 5 interleaved repeats; fastest of each form;
+FA kernel µs and ratio vs the fastest Hadamard, median [min, max] of per-repeat ratios. `v_dot2` fixed = the kernel in
+`fa/` (s_nop fences); `v_dot2` unfixed = the previous kernel (non-deterministic, shown for reference); LLVM `v_dot2` =
+the same term via the `llvm.amdgcn.fdot2` intrinsic, so the compiler inserts the wait states (research build, not in
+`fa/`; spills 4–5 VGPRs in its fastest configs).
+
+| model | T | Had | 2DP MFMA | 2DP `v_dot2` unfixed | 2DP `v_dot2` fixed | 2DP LLVM `v_dot2` | fixed vs unfixed | front end Had / 2DP |
+|---|---|---|---|---|---|---|---|---|
+| 1B | 2048 | 36.4 | 38.4 (+5.3 % [+5.1, +5.7]) | 43.2 (+19.4 %) | 43.9 (+20.9 % [+19.5, +21.3]) | 43.6 (+20.4 %) | +1.3 % [+1.1, +1.6] | 56.6 / 52.0 |
+| 1B | 4096 | 135.4 | 143.3 (+5.7 %) | 168.9 (+24.9 %) | 170.9 (+26.2 % [+26.1, +26.2]) | 169.8 (+25.4 %) | +1.0 % | 70.8 / 58.5 |
+| 1B | 8192 | 527.2 | 562.0 (+6.5 %) | 658.6 (+24.9 %) | 665.2 (+26.2 % [+25.4, +26.5]) | 660.4 (+25.4 %) | +0.9 % | 146.7 / 115.1 |
+| 1B | 16384 | 2115.0 | 2249.7 (+6.6 %) | 2599.7 (+23.0 %) | 2621.7 (+23.9 % [+23.7, +24.4]) | 2596.7 (+22.9 %) | +0.9 % | 267.4 / 206.9 |
+| 8B | 2048 | 62.4 | 64.7 (+3.7 %) | 69.5 (+11.4 %) | 70.4 (+12.8 % [+12.4, +12.9]) | 70.9 (+13.5 %) | +1.2 % | 125.8 / 110.6 |
+| 8B | 4096 | 233.1 | 243.4 (+4.4 %) | 264.1 (+13.3 %) | 266.9 (+14.5 %) | 267.9 (+14.9 %) | +1.0 % | 251.6 / 220.7 |
+| 8B | 8192 | 931.3 | 974.3 (+4.6 %) | 1054.9 (+13.1 %) | 1059.2 (+13.7 % [+11.5, +16.9]) | 1048.8 (+12.8 %) | +0.5 % [−0.5, +1.9] | 443.5 / 386.3 |
+| 8B | 16384 | 3707.8 | 3864.9 (+4.3 %) | 4207.3 (+12.9 %) | 4228.0 (+14.0 %) | 4161.9 (+12.2 %) | +1.2 % | 892.4 / 775.9 |
+
+End to end, µs:
+
+| model | T | Had | 2DP MFMA | 2DP `v_dot2` unfixed | 2DP `v_dot2` fixed | 2DP LLVM `v_dot2` |
+|---|---|---|---|---|---|---|
+| 1B | 2048 | 88.8 | 85.5 | 90.8 | 91.2 | 92.2 |
+| 1B | 4096 | 212.0 | 205.4 | 231.1 | 233.0 | 232.2 |
+| 1B | 8192 | 678.9 | 684.2 | 777.6 | 783.8 | 780.4 |
+| 1B | 16384 | 2385.0 | 2464.3 | 2809.9 | 2830.6 | 2821.4 |
+| 8B | 2048 | 190.9 | 179.7 | 184.9 | 185.5 | 185.6 |
+| 8B | 4096 | 492.9 | 469.7 | 493.5 | 493.7 | 497.7 |
+| 8B | 8192 | 1395.5 | 1379.8 | 1463.7 | 1467.1 | 1455.6 |
+| 8B | 16384 | 4603.2 | 4645.6 | 4986.0 | 5013.6 | 4964.2 |
+
+Differences of 2 points or less between the `v_dot2` forms are within this job's noise (8B T = 8192 per-repeat spread
+up to 5 points).
+
+#### Two more attempts on the vector unit (both slower than `v_dot2`)
+
+**Full-rate pair `v_mul_f32` + `v_fmac_f32` per logit, fp32 coefficients produced by the front end.** A copy of P1
+(`p1_2dp_f32.py`, research build, not in this repo) writes `a'` and `b` widened to fp32 (exact); its front end is as
+fast as the fp16 one (table). The kernel needs no conversion, issues 2 full-rate fp32 ops per logit (which co-issue
+with MFMAs), and is correctly rounded (0 of 12.6M logit terms differ from the correctly rounded value; `v_dot2`: 1.5 %
+differ, by ≤ 9.5e-7). Every variant passes O / LSE. Jobs 92472 (8B, U from the model) and 92477 (1B); the `v_dot2`
+column here is the unfixed build. FA µs and ratio vs the fastest Hadamard, median [min, max]:
+
+| model | T | timing | Had | 2DP MFMA | 2DP `v_dot2` (unfixed) | 2DP `v_mul`+`v_fmac` | pair vs `v_dot2` | pair vs MFMA | front end Had / 2DP fp16 / 2DP fp32 |
+|---|---|---|---|---|---|---|---|---|---|
+| 8B | 2048 | FA | 60.4 | 62.8 (+3.9 %) | 67.4 (+11.7 %) | 70.8 (+17.2 % [+17.0, +18.0]) | +4.9 % | +12.8 % | 124.2 / 109.2 / 108.6 |
+| 8B | 2048 | e2e | 186.9 | 175.9 (−5.8 %) | 181.1 (−3.1 %) | 184.8 (−1.1 % [−1.2, −1.0]) | +2.1 % | +5.0 % | |
+| 8B | 4096 | FA | 228.2 | 237.1 (+3.9 %) | 258.0 (+13.1 %) | 274.7 (+20.4 % [+20.3, +20.6]) | +6.6 % | +15.9 % | 243.8 / 214.5 / 214.2 |
+| 8B | 4096 | e2e | 480.9 | 460.2 (−4.3 %) | 483.3 (+0.5 %) | 495.9 (+3.2 %) | +2.7 % | +7.7 % | |
+| 8B | 8192 | FA | 911.0 | 955.2 (+4.8 %) | 1034.8 (+13.4 %) | 1096.0 (+20.5 % [+19.2, +21.0]) | +6.0 % | +14.8 % | 444.0 / 384.3 / 382.9 |
+| 8B | 8192 | e2e | 1358.8 | 1349.6 (−0.4 %) | 1430.4 (+5.5 %) | 1491.2 (+9.6 %) | +4.1 % | +10.3 % | |
+| 8B | 16384 | FA | 3638.6 | 3792.3 (+4.2 %) | 4128.3 (+13.3 %) | 4366.9 (+20.2 % [+19.4, +21.4]) | +6.1 % | +15.4 % | 886.6 / 767.3 / 766.2 |
+| 8B | 16384 | e2e | 4517.4 | 4558.4 (+0.9 %) | 4906.9 (+8.0 %) | 5140.0 (+13.6 %) | +4.9 % | +12.8 % | |
+| 1B | 2048 | FA | 37.5 | 39.8 (+6.3 %) | 44.8 (+19.5 %) | 49.0 (+30.5 % [+30.2, +31.5]) | +9.3 % | +22.6 % | 56.6 / 52.3 / 51.9 |
+| 1B | 2048 | e2e | 90.6 | 87.2 (−3.7 %) | 92.8 (+2.3 %) | 95.9 (+5.9 %) | +3.5 % | +10.0 % | |
+| 1B | 4096 | FA | 138.4 | 146.9 (+6.1 %) | 172.5 (+24.8 %) | 192.9 (+39.4 %) | +11.7 % | +31.1 % | 73.1 / 60.0 / 59.4 |
+| 1B | 4096 | e2e | 216.8 | 209.5 (−3.3 %) | 235.5 (+8.7 %) | 255.7 (+18.0 %) | +8.4 % | +22.0 % | |
+| 1B | 8192 | FA | 546.9 | 596.7 (+9.4 %) | 673.4 (+23.4 %) | 758.1 (+38.7 %) | +12.5 % | +26.9 % | 147.8 / 116.5 / 114.5 |
+| 1B | 8192 | e2e | 701.0 | 708.6 (+1.5 %) | 796.5 (+13.9 %) | 876.6 (+25.2 %) | +10.1 % | +23.6 % | |
+| 1B | 16384 | FA | 2216.9 | 2359.9 (+6.5 %) | 2706.3 (+22.3 %) | 3002.1 (+35.8 %) | +11.0 % | +27.2 % | 275.4 / 212.2 / 210.4 |
+| 1B | 16384 | e2e | 2496.6 | 2602.5 (+4.2 %) | 2938.0 (+18.0 %) | 3208.9 (+28.5 %) | +9.0 % | +23.3 % | |
+
+Against the fixed `v_dot2` the pair's gap is about 1 point smaller (cross-job estimate). Why the pair loses although it
+co-issues is not established: the issue-rate model predicts ~4.5 cycles per logit, the measured cost is about twice
+that; extra LDS traffic for the fp32 `b` contributes (LDS waits rise) but does not explain it fully.
+
+**Placing the `v_dot2`s with the LLIR scheduler plugin** (v2 toolchain; the inline asm converted to the `fdot2`
+intrinsic, the `v_dot2` groups pinned at the head / tail / split of each stage, checked in the ISA). No placement
+lowers the cost per `v_dot2` below the stock schedule: the cycles a placement removes (a `v_dot2` waiting behind an
+MFMA) come back as cycles where neither unit issues. Jobs 92485 (8B, best config 256 x 64) and 92483 (1B, 256 x 128,
+lazy, "prio" = lazy + prio); FA µs and ratio vs the fastest Hadamard of the same job:
+
+| model | T | Had | 2DP MFMA | `v_dot2` stock | `v_dot2` plugin default | `v_dot2` pinned (best) |
+|---|---|---|---|---|---|---|
+| 8B | 2048 | 59.1 | 61.5 (+4.1 % [+3.9, +4.1]) | 67.6 (+14.4 % [+14.0, +14.6]) | 66.4 (+12.4 % [+11.5, +13.3]) | 67.3 (+13.6 % [+12.6, +14.2]) |
+| 8B | 4096 | 220.1 | 232.0 (+5.5 % [+5.4, +5.8]) | 256.5 (+16.6 % [+16.3, +16.7]) | 252.9 (+14.8 % [+14.6, +15.3]) | 255.2 (+16.0 % [+16.0, +16.2]) |
+| 8B | 8192 | 890.4 | 940.0 (+5.6 % [+5.1, +5.7]) | 1026.0 (+15.1 % [+14.9, +15.4]) | 1008.5 (+13.3 % [+12.9, +14.1]) | 1014.9 (+14.1 % [+13.5, +14.1]) |
+| 8B | 16384 | 3519.6 | 3729.1 (+5.8 % [+5.8, +6.2]) | 4099.1 (+16.5 % [+16.2, +17.0]) | 4039.6 (+14.8 % [+14.5, +15.3]) | 4076.5 (+15.8 % [+15.2, +16.3]) |
+| 1B | 2048 | 37.6 | 40.1 (+6.9 % [+6.1, +7.2]) | 44.9 prio (+19.7 % [+18.0, +20.2]) | 44.9 (+19.5 % [+19.0, +19.9]) | 44.1 (+17.5 % [+17.2, +17.8]) |
+| 1B | 4096 | 141.4 | 147.6 (+4.2 % [+4.2, +4.4]) | 171.8 (+21.4 % [+21.2, +21.9]) | 172.8 (+22.1 % [+21.9, +22.6]) | 172.1 (+21.6 % [+21.5, +22.3]) |
+| 1B | 8192 | 556.4 | 598.1 (+7.4 % [+7.2, +8.0]) | 672.2 (+20.8 % [+20.6, +21.0]) | 676.6 (+21.5 % [+21.4, +21.7]) | 675.1 (+21.3 % [+21.2, +21.3]) |
+| 1B | 16384 | 2247.5 | 2374.0 (+5.6 % [+5.3, +6.3]) | 2720.0 (+21.0 % [+20.7, +21.9]) | 2734.5 prio (+21.7 % [+20.9, +23.6]) | 2736.1 (+21.8 % [+20.6, +22.4]) |
+
+The 8B "plugin default" gain comes from the plugin speeding up the whole kernel (Hadamard 3.5 % faster with it), not
+from the `v_dot2` placement. The `v_dot2` builds here are the unfixed inline asm (stock) or the intrinsic (pinned).
+This sweep covered fewer configurations than the tables above (8B: 256 x 64 plain and lazy + nosink + scal; 1B: lazy
+and lazy + prio).
 
 Other `v_dot2` placements (in the QK^T stage, at the head of the softmax, under the P.V MFMAs) were slower; builds
 with the scalarize compile flag gave wrong results for some of these other placements, which are not used.
