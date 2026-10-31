@@ -26,6 +26,10 @@ With the rank-2 term on the vector unit (`v_dot2`, one per logit) instead: 1B +1
 kernel and +2 / +9 / +14 / +17 % end to end (T = 2k–16k, job 92415); 8B +13 / +12 / +14 % and 0 / +4 / +9 %
 (T = 4k–16k, job 92416). See [MFMA vs `v_dot2`](#rank-2-term-mfma-vs-v_dot2-full-flash-attention).
 
+Against fp16 flash attention (same kernel with an fp16 QK^T, same toolchain and search), the MXFP4 FA kernel is
+1.28–1.34x faster with Hadamard and 1.19–1.29x faster with 2DP (MFMA) at T = 2k–16k, 1B and 8B (jobs 92428 / 92429;
+[details](#mxfp4-vs-fp16-flash-attention)).
+
 | file | content |
 |---|---|
 | `p1_2dp.py` | P1 (Gluon): 8-wave ping-pong projection GEMM with the 2DP epilogue: RoPE, plane coordinates `a' = (1-gamma) a`, MXFP4 of the residual. `epi=0` is a plain fp16 store, used as the Hadamard projection |
@@ -266,6 +270,8 @@ this repo.
 | `fa/fmha_roof.py`, `fa/fmha_roof_lds.py`, `fa/fmha_kbank.py` | kernel helpers and the D = 128 code path it reuses |
 | `fa/fa_setup.py` | inputs: runs the front ends of `../` (`p1_2dp`, `had_j2`) once per T |
 | `fa/bench_d64.py` | benchmark: O / LSE vs torch, interleaved timing (FA kernel and end to end), ISA census; sets `readme1b`, `readme8b` |
+| `fa/fmha_fp.py` | the kernel with an fp16 QK^T mode (`QF16`) for the fp16 baseline; same loop as `fmha_d64.py` |
+| `fa/bench_fp.py`, `fa/tut_env.py` | fp16 vs MXFP4 benchmark; `tut_env` applies two small edits to the tutorial's `fmha_v3.py` at import time for the parity reference |
 | `fa/bench_vdot2.py` | Hadamard vs MFMA 2DP vs `v_dot2` 2DP in the same job (implementations `had`, `mf_p0`, `vd_m`, `vd_mk`, ...) |
 
 The kernel imports `fmha_v3.py` / `common.py` from the public gfx950 Gluon tutorial ("High-Performance Gluon
@@ -416,6 +422,45 @@ python bench_vdot2.py --model 1b --only w8m256n128_vf1_lazy w8m256n128_vf1_lazy_
     --check-ts 2048 8192 --ts 2048 4096 8192 16384 --rounds 5 --e2e
 python bench_vdot2.py --model 8b --only w8m256n64 w8m256n64_lazy_prio --impls had mf_p0 vd_m \
     --check-ts 2048 8192 --ts 2048 4096 8192 16384 --rounds 5 --e2e --u-path U_selfgen_8b_2dp_allrand_s0.pt --u-layer 15
+```
+
+#### MXFP4 vs fp16 flash attention
+
+Baseline: the same kernel with an fp16 QK^T ([`fa/fmha_fp.py`](fa/fmha_fp.py), mode `QF16`): Q fp16 in registers, K
+fp16 staged once per workgroup in LDS by direct-to-LDS loads, QK^T on fp16 32x32x16 MFMAs; softmax, P.V and the O /
+LSE stores are the MXFP4 kernel's. Variant `f16q` folds the softmax scale into Q (as the tutorial's `SCALE_ON_Q`),
+which fp4 cannot do. Equal treatment of fp16 and MXFP4:
+- same toolchain, no scheduler plugin (asserted);
+- same inputs: fp16 Q / K / V are views of the projection buffer whose V the MXFP4 kernels read (same strides); same
+  outputs (O fp16 + LSE);
+- same tile / knob / compile-flag search for every method, fastest of each method picked in the same job;
+  configurations that spill registers are excluded;
+- every timed variant's O / LSE checked against torch at T = 2048 and 16384.
+
+Parity check: the tutorial `fmha_v3` (head_dim 128 only; it does not compile at 64) is within noise of our fp16 mode
+at 8B (fastest vs fastest, ours / tutorial 0.999–1.005 at T = 2k–16k), so the fp16 baseline is not handicapped.
+
+FA kernel alone, µs, 5 interleaved repeats, speedup = fp16 time / MXFP4 time (median [min, max] of per-repeat ratios);
+jobs 92428 (1B) and 92429 (8B). 2DP is the MFMA form.
+
+| model | T | fp16 | MXFP4 Hadamard | MXFP4 2DP | Hadamard speedup | 2DP speedup |
+|---|---|---|---|---|---|---|
+| 1B | 2048 | 49.6 | 39.0 | 41.8 | 1.28x [1.17, 1.33] | 1.19x [1.19, 1.20] |
+| 1B | 4096 | 181.2 | 139.6 | 148.9 | 1.30x [1.30, 1.30] | 1.22x [1.22, 1.22] |
+| 1B | 8192 | 731.3 | 549.1 | 599.2 | 1.33x [1.32, 1.34] | 1.22x [1.21, 1.25] |
+| 1B | 16384 | 2958.2 | 2220.3 | 2382.9 | 1.33x [1.33, 1.34] | 1.24x [1.23, 1.25] |
+| 8B | 2048 | 80.0 | 61.4 | 63.0 | 1.29x [1.28, 1.32] | 1.27x [1.25, 1.27] |
+| 8B | 4096 | 304.0 | 229.2 | 235.6 | 1.33x [1.32, 1.34] | 1.29x [1.29, 1.31] |
+| 8B | 8192 | 1221.3 | 913.4 | 947.8 | 1.34x [1.32, 1.34] | 1.29x [1.28, 1.29] |
+| 8B | 16384 | 4831.1 | 3649.4 | 3762.5 | 1.32x [1.31, 1.33] | 1.29x [1.28, 1.29] |
+
+Timing with CUDA-graph replay (no host launch overhead) gives the same picture: Hadamard 1.29–1.34x, 2DP 1.22–1.29x.
+The `v_dot2` form of 2DP is not in this comparison yet. Review of this comparison is pending.
+
+```bash
+python bench_fp.py --model 1b --mode full --ts 2048 4096 8192 16384 --check-ts 2048 16384 --rounds 5 --screen-t 8192
+python bench_fp.py --model 8b --mode full --ts 2048 4096 8192 16384 --check-ts 2048 16384 --rounds 5 --screen-t 8192 \
+    --u-path U_selfgen_8b_2dp_allrand_s0.pt --u-layer 15
 ```
 
 Where the overhead came from (switch-off ablations, wrong outputs, diagnostic only; T = 8192):
